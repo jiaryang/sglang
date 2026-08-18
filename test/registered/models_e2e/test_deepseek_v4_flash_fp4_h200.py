@@ -66,6 +66,7 @@ class TestDSV4FlashFP4H200(
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
+                "--disable-custom-all-reduce",
                 "--tp",
                 "4",
                 "--moe-runner-backend",
