@@ -66,6 +66,8 @@ class TestDSV4FlashFP4H200(
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
+                "--cuda-graph-backend-decode",
+                "disabled",
                 "--tp",
                 "4",
                 "--moe-runner-backend",
