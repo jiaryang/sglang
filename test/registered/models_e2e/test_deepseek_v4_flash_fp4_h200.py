@@ -64,6 +64,7 @@ class TestDSV4FlashFP4H200(
             cls.model,
             cls.base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
+            env={"SGLANG_CUSTOM_ALLREDUCE_ALGO": "2stage"},
             other_args=[
                 "--trust-remote-code",
                 "--tp",
