@@ -1421,7 +1421,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             page_size = pool.page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
-            out_loc = forward_batch.out_cache_loc
+            # Must use the resolved parameter, not forward_batch.out_cache_loc:
+            # the graph split-op passes a slice (out_cache_loc[:extend_num_tokens])
+            # to match key[:extend_num_tokens], since capture runs on padded
+            # static shapes. Re-reading the batch tensor would desync the lengths.
+            out_loc = out_cache_loc
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
             indexer_k_quant_and_cache(
