@@ -104,8 +104,15 @@ def pcg_dsa_indexer_prefill_split(
     # call site pre-allocates it at a static, padded shape and a downstream
     # captured graph reads it at a fixed address; eager code instead allocates
     # and returns a fresh, naturally-sized tensor each call.
-    assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
-    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+    assert (
+        _is_cuda or _is_hip
+    ), "Internal error: DSA graph dispatch is only supported on CUDA/HIP"
+    # Mirror the eager path's per-platform choice (dsa_indexer.py, forward_cuda)
+    # so the graph and eager surfaces quantize identically.
+    if _is_hip:
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+    else:
+        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
     forward_context = get_tc_piecewise_forward_context()
     forward_batch = forward_context.forward_batch
