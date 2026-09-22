@@ -494,7 +494,10 @@ def triton_sparse_mla_decode_splitk(
     returns: [1, bs, H, d_v] bf16
     """
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
-    use_fp8_dot = is_fp8
+    # gfx1250: preserve BF16 query precision while reading the compact FP8 KV
+    # cache. GLM latent-K magnitudes are too small for an additional Q->FP8
+    # cast to remain numerically stable.
+    use_fp8_dot = is_fp8 and torch.cuda.get_device_capability() != (12, 5)
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]

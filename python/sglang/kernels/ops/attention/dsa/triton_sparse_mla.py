@@ -400,7 +400,11 @@ def _triton_sparse_mla_fwd_single(
 ) -> torch.Tensor:
     """Single-pass prefill: grid=(seq,), loops over all topk per CTA."""
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
-    use_fp8_dot = is_fp8
+    # gfx1250's FP8 KV values can have a much smaller magnitude than the query
+    # (GLM's latent K is commonly around 1e-3). Casting BF16 Q to FP8 inside
+    # the dot path loses too much precision. Keep the compact FP8 cache, but
+    # upcast both operands to BF16 for the matrix products on this architecture.
+    use_fp8_dot = is_fp8 and torch.cuda.get_device_capability() != (12, 5)
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     assert d_v % 128 == 0, f"Triton sparse MLA requires d_v divisible by 128, got {d_v}"
@@ -955,7 +959,7 @@ def _triton_sparse_mla_fwd_splitk(
 ) -> torch.Tensor:
     """Split-K path for short sequences."""
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
-    use_fp8_dot = is_fp8
+    use_fp8_dot = is_fp8 and torch.cuda.get_device_capability() != (12, 5)
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]

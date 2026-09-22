@@ -23,7 +23,11 @@ from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.utils import get_bool_env_var, is_hip
-from sglang.srt.utils.common import direct_register_custom_op, is_gfx95_supported
+from sglang.srt.utils.common import (
+    direct_register_custom_op,
+    is_gfx1250_supported,
+    is_gfx95_supported,
+)
 
 NVFP4_BLOCK_SIZE = 16
 
@@ -37,7 +41,9 @@ _is_hip = is_hip()
 # linear layers dequantize their FP4 weights to bf16 once at load and run a
 # plain bf16 GEMM. This trades a little memory for correctness on hardware that
 # cannot execute the fp4 kernel at all.
-_dequant_linear_to_bf16 = _is_hip and get_bool_env_var("AITER_FORCE_A8W4", "false")
+_dequant_linear_to_bf16 = _is_hip and (
+    get_bool_env_var("AITER_FORCE_A8W4", "false") or is_gfx1250_supported()
+)
 
 # MXFP4 (OCP MX FP4 / e2m1) decode table, indexed by the 4-bit code.
 _MXFP4_VALUES = [

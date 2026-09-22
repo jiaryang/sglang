@@ -73,6 +73,7 @@ def prepare_w4a8_gfx1250_weights(
     w2_weight: torch.Tensor,
     w2_weight_scale: torch.Tensor,
     w2_weight_bias: torch.Tensor,
+    interleave_w13: bool = True,
 ):
     """Reshape SGLang's loaded Quark W4A8 MoE buffers into the ``[E, K, N]``
     (contraction-major) packed layout consumed by ``moe_gemm_a8w4``.
@@ -91,12 +92,20 @@ def prepare_w4a8_gfx1250_weights(
         w2   [E, I//2, H]    w2_scale  [E, I//32, H]    w2_bias  [E, H]
     """
     # Interleave gate/up on w13 (output dim) so the fused SwiGLU picks gate on
-    # even lanes and up on odd lanes. The interleave output is contiguous, so
-    # the subsequent transpose(1, 2) yields a *column-major* [E, K, N] view
-    # (stride(-2) == 1), which ``moe_gemm_a8w4`` requires for MXFP weights.
-    w13_weight = _interleave_gate_up(w13_weight)
-    w13_weight_scale = _interleave_gate_up(w13_weight_scale)
-    w13_weight_bias = _interleave_gate_up(w13_weight_bias)
+    # even lanes and up on odd lanes. GLM W4A4 uses SEPARATED SiLU-and-mul
+    # instead, so callers pass ``interleave_w13=False``. The interleave output
+    # is contiguous, so the subsequent transpose(1, 2) yields a *column-major*
+    # [E, K, N] view (stride(-2) == 1), which ``moe_gemm_a8w4`` requires for
+    # MXFP weights. Without interleave, make w13 contiguous first so the
+    # transpose is still unit-strided on K.
+    if interleave_w13:
+        w13_weight = _interleave_gate_up(w13_weight)
+        w13_weight_scale = _interleave_gate_up(w13_weight_scale)
+        w13_weight_bias = _interleave_gate_up(w13_weight_bias)
+    else:
+        w13_weight = w13_weight.contiguous()
+        w13_weight_scale = w13_weight_scale.contiguous()
+        w13_weight_bias = w13_weight_bias.contiguous()
 
     # Transpose to contraction-major [E, K(packed), N] *without* making it
     # contiguous, so the K dimension stays unit-strided (column-major).
@@ -208,3 +217,209 @@ def aiter_w4a8_gfx1250_forward(
     )
 
     return intermediate_cache3.contiguous()
+
+
+_FP8_E4M3_MAX = 448.0
+_FUSED_ROUTING_NK_LIMIT = 4096
+
+
+def _fp8_per_tensor_scale(x: torch.Tensor) -> torch.Tensor:
+    return (x.detach().float().abs().amax().clamp(min=1e-12) / _FP8_E4M3_MAX).to(
+        torch.float32
+    )
+
+
+def _routing_from_topk_torch(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor, n_expts_tot: int
+):
+    ids = topk_ids.reshape(-1).to(torch.int32)
+    scal = topk_weights.reshape(-1)
+    topk_indx = torch.argsort(ids, stable=True).to(torch.int32)
+    n_gates = ids.numel()
+    gate_indx = torch.empty(n_gates, dtype=torch.int32, device=ids.device)
+    gate_indx[topk_indx.long()] = torch.arange(
+        n_gates, device=ids.device, dtype=torch.int32
+    )
+    gate_scal = scal[topk_indx.long()]
+    hist = torch.bincount(ids.long(), minlength=n_expts_tot).to(torch.int32)
+    if hist.numel() > n_expts_tot:
+        hist = hist[:n_expts_tot]
+    elif hist.numel() < n_expts_tot:
+        hist = torch.nn.functional.pad(hist, (0, n_expts_tot - hist.numel()))
+    return hist, topk_indx, gate_indx, gate_scal
+
+
+def _expt_data_from_hist(hist, n_expts_tot: int, n_gates: int, block_m: int):
+    from aiter.ops.triton.moe.moe_routing.routing import ExptData
+
+    device = hist.device
+    token_offs_raw = torch.empty(n_expts_tot + 1, dtype=torch.int32, device=device)
+    token_offs_raw[0] = 0
+    token_offs_raw[1:] = torch.cumsum(hist, dim=0).to(torch.int32)
+
+    n_tiles = (hist + (block_m - 1)) // block_m
+    token_offs_pad = torch.empty(n_expts_tot + 1, dtype=torch.int32, device=device)
+    token_offs_pad[0] = 0
+    token_offs_pad[1:] = torch.cumsum(n_tiles, dim=0).to(torch.int32)
+
+    if n_gates <= n_expts_tot:
+        max_n_tiles = max(n_gates, 1)
+    else:
+        max_n_tiles = max(
+            n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // block_m), 1
+        )
+
+    block_pid_map = torch.full((max_n_tiles,), -1, dtype=torch.int32, device=device)
+    n_filled = int(n_tiles.sum().item())
+    if n_filled > 0:
+        experts = torch.arange(n_expts_tot, device=device, dtype=torch.int32)
+        expert_ids = torch.repeat_interleave(experts, n_tiles.to(torch.int64))
+        starts = token_offs_pad[:-1].repeat_interleave(n_tiles.to(torch.int64))
+        packed = torch.arange(n_filled, device=device, dtype=torch.int32)
+        local_b = packed - starts
+        dest = (starts + local_b).long()
+        block_pid_map[dest] = (local_b << 16) + expert_ids
+    return ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+
+
+def routing_from_sglang_topk(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    n_expts_tot: int,
+):
+    """Build aiter ``RoutingData`` from SGLang's already-computed top-k.
+
+    Do not re-run aiter ``routing()`` on DeepSeek/GLM logits: that would ignore
+    grouped top-k, fused shared-expert slots, and ``routed_scaling_factor``.
+    """
+    import triton
+    from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+
+    topk_ids = topk_ids.contiguous()
+    topk_weights = topk_weights.contiguous()
+    n_tokens, n_expts_act = topk_ids.shape
+    n_gates = n_tokens * n_expts_act
+
+    tokens_per_expt = max(1, n_gates // n_expts_tot)
+    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+
+    if n_gates <= _FUSED_ROUTING_NK_LIMIT:
+        try:
+            from aiter.ops.triton.fusions.fused_routing_from_topk import (
+                fused_routing_from_topk,
+            )
+
+            hist, topk_indx, gate_indx, gate_scal = fused_routing_from_topk(
+                topk_weights, topk_ids.to(torch.int32), n_expts_tot
+            )
+        except Exception:
+            hist, topk_indx, gate_indx, gate_scal = _routing_from_topk_torch(
+                topk_weights, topk_ids, n_expts_tot
+            )
+    else:
+        hist, topk_indx, gate_indx, gate_scal = _routing_from_topk_torch(
+            topk_weights, topk_ids, n_expts_tot
+        )
+
+    expt_data = _expt_data_from_hist(hist, n_expts_tot, n_gates, block_m)
+    routing_data = RoutingData(
+        block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data
+    )
+    return routing_data, topk_indx, gate_indx
+
+
+def aiter_w4a8_gfx1250_forward_from_topk(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w13_weight_bias: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    w2_weight_bias: torch.Tensor,
+    apply_router_weight_on_input: bool = False,
+    apply_swiglu: bool = False,
+    gemm1_alpha: float = 1.0,
+    gemm1_limit: float = 1e9,
+    swiglu_add_residual: bool = False,
+) -> torch.Tensor:
+    """MXFP4 W4A8 MoE for gfx1250 using existing SGLang top-k (GLM / DeepSeek).
+
+    GEMM1 writes bf16, then SiLU-and-mul (SEPARATED gate/up, matching GLM) or
+    fused SwiGLU (INTERLEAVED, matching GPT-OSS). GEMM2 uses a dynamically
+    computed per-tensor FP8 scale. Gather is done in torch (TDM gather is
+    broken on gfx1250).
+    """
+    imported = _import_aiter_w4a8()
+    if imported is None:
+        raise RuntimeError(
+            "aiter triton W4A8 MoE (moe_gemm_a8w4) is required for the gfx1250 "
+            "MXFP4 path but was not found in the installed aiter build."
+        )
+    _, moe_gemm_a8w4, downcast_to_static_fp8 = imported
+
+    if hidden_states.dtype != torch.bfloat16:
+        hidden_states = hidden_states.to(torch.bfloat16)
+
+    n_expts_tot = w13_weight.shape[0]
+    routing_data, gather_idx, scatter_idx = routing_from_sglang_topk(
+        topk_weights, topk_ids, n_expts_tot
+    )
+    gammas = routing_data.gate_scal
+    topk = topk_ids.shape[-1]
+
+    gather_src = gather_idx.to(torch.long) // topk
+    x = hidden_states[gather_src]
+    if apply_router_weight_on_input:
+        x = x * gammas[:, None].to(x.dtype)
+
+    a13_scale = _fp8_per_tensor_scale(x)
+    x_fp8 = downcast_to_static_fp8(x, a13_scale)
+
+    intermediate = moe_gemm_a8w4(
+        x_fp8,
+        w13_weight,
+        None,
+        w13_weight_scale,
+        a13_scale,
+        None,
+        w13_weight_bias,
+        routing_data,
+        gather_indx=None,
+        scatter_indx=None,
+        gammas=None,
+        swizzle_mx_scale=None,
+        out_dtype=torch.bfloat16,
+        apply_swiglu=apply_swiglu,
+        alpha=gemm1_alpha,
+        limit=gemm1_limit,
+        swiglu_add_residual=swiglu_add_residual,
+    )
+
+    if not apply_swiglu:
+        d = intermediate.shape[-1] // 2
+        intermediate = torch.nn.functional.silu(intermediate[..., :d]) * intermediate[
+            ..., d:
+        ]
+
+    a2_scale = _fp8_per_tensor_scale(intermediate)
+    x2 = downcast_to_static_fp8(intermediate.contiguous(), a2_scale)
+
+    output = moe_gemm_a8w4(
+        x2,
+        w2_weight,
+        None,
+        w2_weight_scale,
+        a2_scale,
+        None,
+        w2_weight_bias,
+        routing_data,
+        gather_indx=None,
+        scatter_indx=scatter_idx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale=None,
+        out_dtype=torch.bfloat16,
+    )
+    return output.contiguous()
+
