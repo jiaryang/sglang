@@ -18,6 +18,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _PREFERRED_BLOCK_K,
     _cu_count,
+    _kv_dequant_scale,
     _kv_splits_heuristic,
     _next_pow2,
     _no_async_copy,
@@ -498,6 +499,12 @@ def triton_sparse_mla_decode_splitk(
     # cache. GLM latent-K magnitudes are too small for an additional Q->FP8
     # cast to remain numerically stable.
     use_fp8_dot = is_fp8 and torch.cuda.get_device_capability() != (12, 5)
+    # The HIP FP8 cache holds nope * kv_scale; undo it the same way prefill
+    # does. kv_scale is non-trivial only on gfx1250, where use_fp8_dot is
+    # False, so q_nope stays bf16 and the division cannot underflow a cast.
+    kv_scale = _kv_dequant_scale(kv)
+    if kv_scale != 1.0:
+        q_nope = q_nope * (1.0 / kv_scale)
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
@@ -575,6 +582,8 @@ def triton_sparse_mla_decode_splitk(
                 num_warps=4,
                 num_stages=2,
             )
+        if kv_scale != 1.0:
+            out.mul_(1.0 / kv_scale)
         return out.unsqueeze(0)
 
     tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
@@ -632,6 +641,8 @@ def triton_sparse_mla_decode_splitk(
         BLOCK_K=BLOCK_K,
         num_warps=4,
     )
+    if kv_scale != 1.0:
+        out.mul_(1.0 / kv_scale)
     return out.unsqueeze(0)
 
 

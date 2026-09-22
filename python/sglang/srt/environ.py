@@ -1651,6 +1651,14 @@ class Envs:
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
+    # GLM's MLA latent K nope half has an absmax around 3e-2, so a plain
+    # BF16->FP8 cast lands almost every element in the e4m3 subnormal range
+    # (min normal 2^-6) and the cache becomes noise. The HIP triton DSA path
+    # therefore stores nope * scale and divides it back out at read time. 128
+    # keeps ~100x of overflow headroom over the observed absmax; set to 1 to
+    # disable. The rope half is never scaled: at absmax ~7.5 it already casts
+    # cleanly and would clip against the 448 ceiling.
+    SGLANG_DSA_HIP_MLA_FP8_KV_SCALE = EnvFloat(128.0)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
