@@ -21,6 +21,10 @@ import torch
 _TDM_DISABLED = False
 
 
+def _is_gfx1250() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 5)
+
+
 def _import_aiter_w4a8():
     """Import the aiter triton routing + a8w4 GEMM entry points.
 
@@ -302,6 +306,13 @@ def routing_from_sglang_topk(
 
     tokens_per_expt = max(1, n_gates // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    if _is_gfx1250():
+        # gfx1250 quirk 3: moe_gemm_a8w4 only produces correct results at
+        # block_m == 16. Larger tiles, which the heuristic above picks as soon
+        # as a forward carries enough tokens, return garbage (rel RMS 0.19 at
+        # block_m=32, NaN/Inf at 64 and 128) and wreck generation quality for
+        # any batch beyond a handful of tokens.
+        block_m = 16
 
     if n_gates <= _FUSED_ROUTING_NK_LIMIT:
         try:
