@@ -6,8 +6,41 @@ import torch
 import triton
 import triton.language as tl
 
+import functools
+
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils import is_gfx1250_supported, is_hip
+
+
+@functools.lru_cache(maxsize=1)
+def get_mla_fp8_kv_scale() -> float:
+    """Multiplier applied to the MLA K *nope* half before its FP8 cast.
+
+    The HIP DSA kernels store the compact 576B layout (512 fp8 nope + 64 fp8
+    rope) with no per-block scales. GLM's latent nope half has an absmax around
+    3e-2, so an unscaled cast collapses it into e4m3 subnormals (22% relative
+    error). Writers multiply it by this factor, readers divide it back out.
+
+    The rope half is left alone: it is ~260x larger (absmax ~7.5), casts to
+    e4m3 at 2.5% error on its own, and would saturate the 448 ceiling if it
+    were scaled too, which destroys the positional signal.
+
+    Only the triton kernels implement the read-side compensation, so the scale
+    stays at 1.0 for the tilelang/aiter backends, which share the same layout,
+    and it is limited to gfx1250, the only arch this has been validated on.
+    """
+    if not is_hip() or not is_gfx1250_supported():
+        return 1.0
+    kernel = get_exec().kernel
+    if (kernel.dsa_prefill_backend, kernel.dsa_decode_backend) != (
+        "triton",
+        "triton",
+    ):
+        return 1.0
+    from sglang.srt.environ import envs
+
+    return float(envs.SGLANG_DSA_HIP_MLA_FP8_KV_SCALE.get())
 
 
 @triton.jit
@@ -275,6 +308,8 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     cache_k_rope_ptr,
     loc_ptr,
     reserved_skip_index,
+    kv_scale,
+    fp8_max,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
@@ -299,6 +334,10 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     is_valid = loc != reserved_skip_index
     safe_loc = tl.where(is_valid, loc, 0)
     dst_ptr = kv_buffer_fp8_ptr + safe_loc * buffer_stride + offs
+
+    # Only the nope half is scaled; the rope half is already well inside the
+    # e4m3 normal range and would clip against fp8_max if it were scaled too.
+    scale = tl.where(offs < nope_dim, kv_scale, 1.0)
 
     if base + BLOCK <= nope_dim:
         src = tl.load(
@@ -326,6 +365,10 @@ def set_mla_kv_buffer_fp8_quant_kernel(
             other=0.0,
         )
         src = tl.where(is_nope, src_nope, src_rope)
+
+    # Lift the nope half out of the e4m3 subnormal range; readers divide
+    # kv_scale back out. Clamping guards against unexpected K outliers.
+    src = tl.clamp(src.to(tl.float32) * scale, -fp8_max, fp8_max)
 
     # Destination pointer is FP8-typed view; tl.store performs downcast.
     tl.store(dst_ptr, src, mask=mask & is_valid)
@@ -358,12 +401,16 @@ def set_mla_kv_buffer_triton_fp8_quant(
 
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
+    fp8_max = float(torch.finfo(fp8_dtype).max)
+
     set_mla_kv_buffer_fp8_quant_kernel[grid](
         kv_buffer_fp8,
         cache_k_nope,
         cache_k_rope,
         loc,
         reserved_skip_index,
+        get_mla_fp8_kv_scale(),
+        fp8_max,
         kv_buffer_fp8.stride(0),
         cache_k_nope.stride(0),
         cache_k_rope.stride(0),

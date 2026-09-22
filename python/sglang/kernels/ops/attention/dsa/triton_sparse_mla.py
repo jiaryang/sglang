@@ -37,6 +37,15 @@ _SUPPORTED_INPUT_DTYPES = (
 )
 
 
+def _kv_dequant_scale(kv: torch.Tensor) -> float:
+    """Factor the FP8 KV writer multiplied into the cache, or 1.0 for BF16."""
+    if kv.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        return 1.0
+    from sglang.kernels.ops.kvcache.mla_buffer import get_mla_fp8_kv_scale
+
+    return get_mla_fp8_kv_scale()
+
+
 def _validate_input_dtypes(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -1213,6 +1222,15 @@ def triton_sparse_mla_fwd(
 
     Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd.
     """
+    # The HIP FP8 cache holds nope * kv_scale and leaves rope unscaled, so the
+    # factor cannot be folded into sm_scale: pre-divide q_nope instead, which
+    # cancels it in the nope term of the logits and leaves the rope term alone.
+    # V is entirely the nope half, so the output still carries one factor of
+    # kv_scale. Both divisions are exact for power-of-two scales.
+    kv_scale = _kv_dequant_scale(kv)
+    if kv_scale != 1.0:
+        q_nope = q_nope * (1.0 / kv_scale)
+
     seq = q_nope.shape[0]
     H = q_nope.shape[1]
     num_cu = _cu_count(q_nope.device)
@@ -1239,7 +1257,7 @@ def triton_sparse_mla_fwd(
                 indices_2d = indices_2d.contiguous()
             topk_length = q8kv8_topk_length_from_indices(indices_2d)
         with _no_async_copy():
-            return _triton_sparse_mla_fwd_splitk(
+            out = _triton_sparse_mla_fwd_splitk(
                 q_nope,
                 q_rope,
                 kv,
@@ -1250,28 +1268,35 @@ def triton_sparse_mla_fwd(
                 topk_length=topk_length,
                 use_topk_length=True,
             )
-    if base_ctas > num_cu:
+    elif base_ctas > num_cu:
         if optimize_gfx950_fp8:
             with _no_async_copy():
-                return _triton_sparse_mla_fwd_splitk(
+                out = _triton_sparse_mla_fwd_splitk(
                     q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits=1
                 )
-        return _triton_sparse_mla_fwd_single(q_nope, q_rope, kv, indices, sm_scale, d_v)
-    kv_splits = min(
-        _kv_splits_heuristic(
-            seq, H, BLOCK_H, target_wg_per_cu=1.0, max_kv_splits=max_kv_splits
-        ),
-        max_kv_splits,
-    )
-    if optimize_gfx950_fp8:
-        kv_splits = _gfx950_sparse_mla_kv_splits(
-            base_ctas,
-            topk,
-            BLOCK_K,
-            num_cu,
-            kv_splits,
+        else:
+            out = _triton_sparse_mla_fwd_single(
+                q_nope, q_rope, kv, indices, sm_scale, d_v
+            )
+    else:
+        kv_splits = min(
+            _kv_splits_heuristic(
+                seq, H, BLOCK_H, target_wg_per_cu=1.0, max_kv_splits=max_kv_splits
+            ),
             max_kv_splits,
         )
-    return _triton_sparse_mla_fwd_splitk(
-        q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits
-    )
+        if optimize_gfx950_fp8:
+            kv_splits = _gfx950_sparse_mla_kv_splits(
+                base_ctas,
+                topk,
+                BLOCK_K,
+                num_cu,
+                kv_splits,
+                max_kv_splits,
+            )
+        out = _triton_sparse_mla_fwd_splitk(
+            q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits
+        )
+    if kv_scale != 1.0:
+        out = out.mul_(1.0 / kv_scale)
+    return out
