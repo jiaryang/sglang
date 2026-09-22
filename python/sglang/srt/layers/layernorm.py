@@ -110,9 +110,12 @@ _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     import aiter as _aiter
-    from aiter import layernorm2d_fwd as layer_norm
 
+    # gfx1250 cannot JIT CK tile kernels (ENABLE_CK=0 + ck_tile_shim collide
+    # with real CK headers). Use aiter Triton norms instead of module_norm /
+    # module_rmsnorm HIP extensions.
     if is_gfx1250_supported():
+        from aiter.ops.triton.normalization.norm import layer_norm
         from aiter.ops.triton.normalization.rmsnorm import (
             rms_norm,
         )
@@ -120,6 +123,7 @@ if _use_aiter:
             rmsnorm2d_fwd_with_add as fused_add_rms_norm,
         )
     else:
+        from aiter import layernorm2d_fwd as layer_norm
         from aiter import rmsnorm2d_fwd as rms_norm
         from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 

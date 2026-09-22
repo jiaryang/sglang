@@ -62,6 +62,7 @@ from sglang.srt.utils import (
     ceil_align,
     get_bool_env_var,
     is_cuda,
+    is_gfx1250_supported,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -96,6 +97,7 @@ else:
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_gfx1250_supported = is_gfx1250_supported()
 _is_gfx95_supported = is_gfx95_supported()
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
 # KVBlockSize=64) can be used. Falls back to the legacy page_size=1 / KVBlockSize=1
@@ -1379,7 +1381,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # layout (page_size>=16). Otherwise we fall back to the legacy row-major
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
-        if _use_aiter:
+        # The aiter module_cache build for gfx1250 does not instantiate the
+        # BF16 -> FP8 indexer cache-store specialization. HIP aborts the
+        # process when it tries to resolve that missing kernel symbol, so use
+        # the existing quantize + Triton store path on this architecture.
+        if _use_aiter and not _is_gfx1250_supported:
             page_size = pool.page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
@@ -1437,7 +1443,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        if _is_hip:
+        if _is_hip and not _is_gfx1250_supported:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
