@@ -92,5 +92,45 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
+@pytest.mark.skipif(not is_hip(), reason="radix-select pivot is the ROCm Triton path")
+@pytest.mark.parametrize("batch_size", [1, 6, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 154880])
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9, 0.95, 1.0])
+@pytest.mark.parametrize("logit_scale", [0.0, 1.0, 8.0])
+def test_top_p_pivots_radix(batch_size, vocab_size, p, logit_scale):
+    """The radix-select pivot keeps the same set as the sort + cumsum reference."""
+    from sglang.kernels.ops.sampling.renorm_triton import _renorm_from_pivots
+    from sglang.kernels.ops.sampling.topp_radix_triton import top_p_pivots_radix
+
+    torch.manual_seed(42)
+    if logit_scale == 0.0:
+        pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+        probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    else:
+        logits = torch.randn(batch_size, vocab_size, device="cuda:0") * logit_scale
+        probs = torch.softmax(logits, dim=-1)
+    probs = probs.float().contiguous()
+    top_ps = torch.full((batch_size,), p, device="cuda:0")
+
+    sorted_prob = torch.sort(probs, dim=-1).values
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    cutoff = torch.searchsorted(cdf, (1.0 - top_ps).unsqueeze(1), right=False)
+    cutoff = cutoff.squeeze(1).clamp(max=vocab_size - 1)
+    ref_pivots = sorted_prob.gather(1, cutoff.unsqueeze(1)).squeeze(1)
+
+    pivots = top_p_pivots_radix(probs, top_ps)
+    if p < 1.0:
+        # fp32 summation order differs from the sequential cumsum, which can move the
+        # pivot to an adjacent value when the cdf crosses 1 - p within rounding.
+        same = pivots == ref_pivots
+        assert same.float().mean().item() >= 0.95
+    torch.testing.assert_close(
+        _renorm_from_pivots(probs, ref_pivots),
+        _renorm_from_pivots(probs, pivots),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
