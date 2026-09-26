@@ -4,7 +4,8 @@ Reference semantics (sglang top_p_renorm_probs_triton / FlashInfer): sort ascend
 cdf = cumsum, cutoff = first index with cdf >= 1 - p, pivot = sorted[cutoff], keep x >= pivot.
 Equivalently pivot = min{v in row : G(v) >= 1 - p}, G(v) = sum of x with x <= v. Probs are
 non-negative, so their fp32 bit patterns order like the values; the pivot's bit pattern is
-found BITS bits at a time.
+found BITS bits at a time. When 1 - p <= 0 the search returns 0.0, which keeps every
+entry (the reference returns the row minimum; the kept set is the same).
 
 Pass p (one launch over (rows, blocks)) first finishes the digit selection of pass p - 1:
 every program sums the previous pass's per-block partial bin masses (a few hundred floats)
