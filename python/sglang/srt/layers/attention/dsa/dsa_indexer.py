@@ -1903,7 +1903,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
-        if _is_hip:
+        if _is_hip and not _is_gfx1250_supported:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
