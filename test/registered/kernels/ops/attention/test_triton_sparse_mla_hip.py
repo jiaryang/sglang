@@ -14,7 +14,10 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
 )
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _get_splitk_bufs,
+    _sparse_mla_decode_fused_kernel,
+    _sparse_mla_decode_split_kernel,
     _splitk_bufs,
+    triton_sparse_mla_decode_splitk,
 )
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -154,6 +157,42 @@ def test_reduce_d_chunk_is_bitwise_identical(active_splits):
     torch.testing.assert_close(
         run(_reduce_d_chunk(active_splits, batch * heads)), run(64), rtol=0, atol=0
     )
+
+
+def _num_compiled_variants(kernel) -> int:
+    return sum(len(cache[0]) for cache in kernel.device_caches.values())
+
+
+@pytest.mark.parametrize(
+    "kernel, kv_splits",
+    [(_sparse_mla_decode_fused_kernel, 1), (_sparse_mla_decode_split_kernel, 4)],
+)
+def test_decode_does_not_recompile_per_batch_size(kernel, kv_splits):
+    # The absorbed q_nope comes out of a head-major bmm, so its head stride is
+    # bs * d_v. A stride baked in as constexpr recompiles on every new batch size.
+    torch.manual_seed(0)
+    heads, value_dim, tail_dim, topk = 32, 512, 64, 256
+    kv = torch.randn(
+        4096, 1, value_dim + tail_dim, device="cuda", dtype=torch.bfloat16
+    )
+    before = _num_compiled_variants(kernel)
+    for bs in (3, 7, 16, 33):
+        q_nope = torch.randn(
+            heads, bs, value_dim, device="cuda", dtype=torch.bfloat16
+        ).transpose(0, 1)
+        q_rope = torch.randn(bs, heads, tail_dim, device="cuda", dtype=torch.bfloat16)
+        indices = torch.randint(
+            0, kv.shape[0], (bs, 1, topk), device="cuda", dtype=torch.int32
+        )
+        args = dict(kv=kv, indices=indices, sm_scale=value_dim**-0.5, d_v=value_dim)
+        actual = triton_sparse_mla_decode_splitk(
+            q_nope=q_nope, q_rope=q_rope, kv_splits=kv_splits, **args
+        )
+        expected = triton_sparse_mla_decode_splitk(
+            q_nope=q_nope.contiguous(), q_rope=q_rope, kv_splits=kv_splits, **args
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert _num_compiled_variants(kernel) - before <= 2
 
 
 if __name__ == "__main__":
