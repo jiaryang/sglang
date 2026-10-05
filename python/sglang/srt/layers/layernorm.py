@@ -110,9 +110,11 @@ _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     import aiter as _aiter
-    from aiter import layernorm2d_fwd as layer_norm
 
     if is_gfx1250_supported():
+        # aiter's gfx1250 builds use ENABLE_CK=0, where the CK module_norm
+        # does not build; use the aiter Triton norms on this architecture.
+        from aiter.ops.triton.normalization.norm import layer_norm
         from aiter.ops.triton.normalization.rmsnorm import (
             rms_norm,
         )
@@ -120,6 +122,7 @@ if _use_aiter:
             rmsnorm2d_fwd_with_add as fused_add_rms_norm,
         )
     else:
+        from aiter import layernorm2d_fwd as layer_norm
         from aiter import rmsnorm2d_fwd as rms_norm
         from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
