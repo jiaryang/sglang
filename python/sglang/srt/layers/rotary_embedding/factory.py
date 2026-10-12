@@ -72,22 +72,19 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter.rotary_embedding import AITER_ROPE_TRITON_BACKEND
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 
 
 @functools.lru_cache(maxsize=1)
 def _aiter_rope_unsupported_arch() -> bool:
-    """aiter's HIP rope kernels (csrc/kernels/rope/rope_common.h) depend on
-    ck_tile types that do not build on gfx1250; fall back to sglang's native
-    rope there unless aiter runs its Triton rope (AITER_ROPE_TRITON_BACKEND=1)."""
+    """aiter's rope kernels (csrc/kernels/rope/rope_common.h) depend on ck_tile
+    types that do not build on gfx1250; fall back to sglang's native rope there."""
     if not _is_hip:
         return False
     try:
-        is_gfx1250 = "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+        return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
     except Exception:
         return False
-    return is_gfx1250 and not AITER_ROPE_TRITON_BACKEND
 
 
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}

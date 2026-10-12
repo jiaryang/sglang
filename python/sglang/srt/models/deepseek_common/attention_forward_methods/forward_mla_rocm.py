@@ -150,10 +150,23 @@ if _use_aiter_gfx95:
         fused_qk_rope_cat_and_cache_mla,
     )
 
+def _gfx1250_fused_mla_rope_supported() -> bool:
+    """aiter's gfx1250 Gluon fused_qk_rope_cat_and_cache_mla launch is broken
+    before aiter #5501: the wrapper still passes MAX_EMBD_POS, which the kernel
+    no longer takes."""
+    try:
+        import inspect
+
+        from aiter.ops.triton.fusions import fused_kv_cache
+    except ImportError:
+        return False
+    return "_extra_uniform_args = (cos.shape[0],)" not in inspect.getsource(
+        fused_kv_cache
+    )
+
+
 _use_gfx1250_fused_mla_rope = (
-    _use_aiter
-    and _is_gfx1250_supported
-    and envs.SGLANG_ROCM_GFX1250_FUSED_MLA_ROPE.get()
+    _use_aiter and _is_gfx1250_supported and _gfx1250_fused_mla_rope_supported()
 )
 if _use_gfx1250_fused_mla_rope:
     from aiter.ops.triton.fusions.fused_kv_cache import (
@@ -196,6 +209,23 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
     }
+
+
+_use_gfx1250_absorb_bmm = _use_aiter and _is_gfx1250_supported
+if _use_gfx1250_absorb_bmm:
+    from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
+
+
+def _gfx1250_absorb_bmm_ok(x: torch.Tensor, w: torch.Tensor, w_scale) -> bool:
+    """aiter's bf16 batched GEMM beats torch.bmm on gfx1250 at decode rows only;
+    prefill rows stay on torch.bmm."""
+    return (
+        x.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
+        and isinstance(w_scale, (int, float))
+        and w_scale == 1.0
+        and x.shape[0] <= _ABSORB_BMM_DECODE_MAX_M
+    )
 
 
 def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
@@ -253,6 +283,12 @@ def rocm_absorb_q_bmm(
                         q_nope.shape[1], q_nope.shape[0], attn.w_kc.shape[2]
                     ),
                 )
+            )
+        elif _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(q_nope, attn.w_kc, attn.w_scale):
+            q_nope_out = batched_gemm_bf16(
+                q_nope.transpose(0, 1),
+                attn.w_kc.transpose(1, 2),
+                backend="gluon" if q_nope.shape[0] <= 4 else "triton",
             )
         else:
             q_nope_out = torch.bmm(
@@ -325,11 +361,21 @@ def rocm_absorb_v_bmm(
                 device=attn_output.device,
                 dtype=torch.bfloat16,
             )
-            torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1),
-                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
-                out=_bmm_buf.transpose(0, 1),
-            )
+            if _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(
+                attn_output, attn.w_vc, attn.w_scale
+            ):
+                batched_gemm_bf16(
+                    attn_output.transpose(0, 1),
+                    attn.w_vc.transpose(1, 2),
+                    YQ=_bmm_buf.transpose(0, 1),
+                    backend="gluon",
+                )
+            else:
+                torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                    out=_bmm_buf.transpose(0, 1),
+                )
         else:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
@@ -394,6 +440,31 @@ def rocm_absorb_v_bmm(
     return attn_bmm_output
 
 
+def _has_full_rope_cos_sin(rotary_emb, rope_head_dim: int) -> bool:
+    if hasattr(rotary_emb, "cos_cache"):
+        return True
+    from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+    from sglang.srt.layers.rotary_embedding.rope_variant import (
+        DeepseekScalingRotaryEmbedding,
+    )
+
+    return (
+        type(rotary_emb) in (RotaryEmbedding, DeepseekScalingRotaryEmbedding)
+        and rotary_emb.rotary_dim == rope_head_dim
+        and rotary_emb.cos_sin_cache.shape[-1] == rope_head_dim
+    )
+
+
+def _rope_cos_sin(rotary_emb) -> Tuple[torch.Tensor, torch.Tensor]:
+    """cos/sin tables for the aiter fused rope kernels: aiter's rope module owns
+    them as cos_cache/sin_cache; sglang's keeps them concatenated in
+    cos_sin_cache, which the kernels read as two strided views."""
+    if hasattr(rotary_emb, "cos_cache"):
+        return rotary_emb.cos_cache, rotary_emb.sin_cache
+    cos, sin = rotary_emb.cos_sin_cache.chunk(2, dim=-1)
+    return cos, sin
+
+
 def _fused_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope_out: torch.Tensor,
@@ -425,6 +496,7 @@ def _fused_rope_cat_and_cache(
         out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
     # AITER reads slot_mapping with stride 1, including on the resident path.
     out_cache_loc = out_cache_loc.contiguous()
+    cos, sin = _rope_cos_sin(attn.rotary_emb)
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
@@ -433,8 +505,8 @@ def _fused_rope_cat_and_cache(
         kv_pool.get_key_buffer(attn.attn_mqa.layer_id),
         out_cache_loc,
         positions,
-        attn.rotary_emb.cos_cache,
-        attn.rotary_emb.sin_cache,
+        cos,
+        sin,
         attn.attn_mqa.k_scale,
         attn.rotary_emb.is_neox_style,
         q_out_dtype=q_out_dtype,
@@ -1138,9 +1210,9 @@ class DeepseekMLARocmForwardMixin:
         when running aiter-backend MLA on gfx95 (i.e., the `else` branch in
         forward_absorb_rocm_core that calls fused_qk_rope_cat_and_cache_mla).
 
-        On gfx1250 (SGLANG_ROCM_GFX1250_FUSED_MLA_ROPE) the same branch is taken
-        for triton or aiter decode only, and only when the rope module is aiter's
-        (it owns the cos_cache/sin_cache buffers the fused kernel reads).
+        On gfx1250 the same branch is taken for triton or aiter decode only, and
+        only for a plain rope module whose cos/sin table covers the whole rope
+        head (the fused kernel applies nothing else).
 
         A layer without a rotary_emb has nothing to fuse: that branch reads
         rotary_emb.cos_cache, so skipping the standalone rope there ends in
@@ -1159,5 +1231,5 @@ class DeepseekMLARocmForwardMixin:
             and self.current_attention_backend in _GFX1250_FUSED_MLA_ROPE_BACKENDS
             and not self.use_dsa
             and not get_parallel().dcp_enabled
-            and hasattr(self.rotary_emb, "cos_cache")
+            and _has_full_rope_cos_sin(self.rotary_emb, self.qk_rope_head_dim)
         )
