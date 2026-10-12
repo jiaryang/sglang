@@ -931,6 +931,10 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # gfx1250 MLA decode: replace the standalone rope, q/k concat and KV write
+    # with aiter's fused_qk_rope_cat_and_cache_mla. Needs aiter's rope module
+    # (AITER_ROPE_TRITON_BACKEND=1) for its cos_cache/sin_cache buffers.
+    SGLANG_ROCM_GFX1250_FUSED_MLA_ROPE = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the

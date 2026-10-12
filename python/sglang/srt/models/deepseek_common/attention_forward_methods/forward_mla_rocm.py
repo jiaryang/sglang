@@ -58,6 +58,7 @@ from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_block_scale_fp8,
     _is_gfx95_supported,
+    _is_gfx1250_supported,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -148,6 +149,20 @@ if _use_aiter_gfx95:
         fused_fp8_bmm_rope_cat_and_cache_mla,
         fused_qk_rope_cat_and_cache_mla,
     )
+
+_use_gfx1250_fused_mla_rope = (
+    _use_aiter
+    and _is_gfx1250_supported
+    and envs.SGLANG_ROCM_GFX1250_FUSED_MLA_ROPE.get()
+)
+if _use_gfx1250_fused_mla_rope:
+    from aiter.ops.triton.fusions.fused_kv_cache import (
+        fused_qk_rope_cat_and_cache_mla,
+    )
+
+# Decode backends whose MLA_ROCM core branch takes the fused q/KV from
+# _fused_rope_cat_and_cache with save_kv_cache=False.
+_GFX1250_FUSED_MLA_ROPE_BACKENDS = ("triton", "aiter")
 
 
 _ABSORB_BMM_DECODE_MAX_M = 256
@@ -393,11 +408,15 @@ def _fused_rope_cat_and_cache(
         fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
     )
     # Gluon MLA decode (bh16bn128) requires bf16 Q; vLLM #50563.
+    # Triton decode_attention takes bf16 Q whatever the KV cache dtype.
     q_out_dtype = (
         q_nope_out.dtype
-        if attn.kv_cache_dtype == "fp8_e4m3"
-        and attn.current_attention_backend == "aiter"
-        and q_nope_out.shape[-2] == 12
+        if (
+            attn.kv_cache_dtype == "fp8_e4m3"
+            and attn.current_attention_backend == "aiter"
+            and q_nope_out.shape[-2] == 12
+        )
+        or (_use_gfx1250_fused_mla_rope and attn.current_attention_backend == "triton")
         else kv_cache_dtype
     )
     kv_pool = get_token_to_kv_pool()
@@ -745,7 +764,7 @@ class DeepseekMLARocmForwardMixin:
             or (
                 (not fuse_rope_for_trtllm_mla)
                 and (not self._skip_rope_for_dsa_tilelang_fused())
-                and (not self._skip_rope_for_aiter_fused_mla())
+                and (not self._skip_rope_for_aiter_fused_mla(forward_batch))
                 and (
                     not _use_aiter
                     or not _is_gfx95_supported
@@ -964,7 +983,7 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if self._skip_rope_for_aiter_fused_mla():
+            if self._skip_rope_for_aiter_fused_mla(forward_batch):
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
                     q_nope_out,
@@ -1101,11 +1120,17 @@ class DeepseekMLARocmForwardMixin:
             )
         )
 
-    def _skip_rope_for_aiter_fused_mla(self: DeepseekV2AttentionMLA) -> bool:
+    def _skip_rope_for_aiter_fused_mla(
+        self: DeepseekV2AttentionMLA, forward_batch: Optional[ForwardBatch] = None
+    ) -> bool:
         """
         Skip rope in prepare and let the fused kernel in forward_absorb_rocm_core handle it,
         when running aiter-backend MLA on gfx95 (i.e., the `else` branch in
         forward_absorb_rocm_core that calls fused_qk_rope_cat_and_cache_mla).
+
+        On gfx1250 (SGLANG_ROCM_GFX1250_FUSED_MLA_ROPE) the same branch is taken
+        for triton or aiter decode only, and only when the rope module is aiter's
+        (it owns the cos_cache/sin_cache buffers the fused kernel reads).
 
         A layer without a rotary_emb has nothing to fuse: that branch reads
         rotary_emb.cos_cache, so skipping the standalone rope there ends in
@@ -1113,8 +1138,16 @@ class DeepseekMLARocmForwardMixin:
         """
         # NoPE models (rotary_emb=None, e.g. Kimi-K3) have no rope for the
         # fused kernel to apply; keep both prepare and core on the plain path.
+        if self.rotary_emb is None:
+            return False
+        if _use_aiter_gfx95:
+            return self.current_attention_backend == "aiter"
         return (
-            _use_aiter_gfx95
-            and self.current_attention_backend == "aiter"
-            and self.rotary_emb is not None
+            _use_gfx1250_fused_mla_rope
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_decode()
+            and self.current_attention_backend in _GFX1250_FUSED_MLA_ROPE_BACKENDS
+            and not self.use_dsa
+            and not get_parallel().dcp_enabled
+            and hasattr(self.rotary_emb, "cos_cache")
         )
