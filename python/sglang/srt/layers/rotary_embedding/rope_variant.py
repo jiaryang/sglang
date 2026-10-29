@@ -23,11 +23,22 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_bool_env_var,
+    get_device,
+    is_cuda,
+    is_gfx1250_supported,
+    is_hip,
+    is_npu,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_use_aiter_rope_gfx1250 = (
+    _is_hip and get_bool_env_var("SGLANG_USE_AITER") and is_gfx1250_supported()
+)
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_npu:
@@ -374,8 +385,56 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
-        if _is_hip:
+        self._aiter_cos_sin = None
+        if _use_aiter_rope_gfx1250:
+            self._build_aiter_cos_sin(self.dtype)
+            self._forward_method = self.forward_aiter_cached
+        elif _is_hip:
             self._forward_method = self.forward_native
+
+    def _build_aiter_cos_sin(self, dtype: torch.dtype) -> None:
+        cache = self.cos_sin_cache
+        cos, sin = cache.chunk(2, dim=-1)
+        shape = (cache.shape[0], 1, 1, cos.shape[-1])
+        self._aiter_cos_sin = (
+            cache,
+            cos.to(dtype).reshape(shape).contiguous(),
+            sin.to(dtype).reshape(shape).contiguous(),
+        )
+
+    def forward_aiter_cached(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """aiter's cached-positions rope kernel, in place, on this module's own
+        cos_sin_cache. The module stays sglang's because the gfx1250 fused MLA
+        decode reads cos_sin_cache and checks the module type."""
+        if offsets is not None:
+            return self.forward_native(positions, query, key, offsets)
+        import aiter
+
+        cached, cos, sin = self._aiter_cos_sin
+        if cached is not self.cos_sin_cache or cos.dtype != query.dtype:
+            self._build_aiter_cos_sin(query.dtype)
+            _, cos, sin = self._aiter_cos_sin
+        num_tokens = positions.numel()
+        query_shape, key_shape = query.shape, key.shape
+        query = query.view(1, num_tokens, -1, self.head_size)
+        key = key.view(1, num_tokens, -1, self.head_size)
+        aiter.rope_cached_positions_2c_fwd_inplace(
+            query[..., : self.rotary_dim],
+            key[..., : self.rotary_dim],
+            cos,
+            sin,
+            positions.view(1, num_tokens),
+            0 if self.is_neox_style else 1,
+            reuse_freqs_front_part=True,
+            nope_first=False,
+        )
+        return query.view(query_shape), key.view(key_shape)
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
