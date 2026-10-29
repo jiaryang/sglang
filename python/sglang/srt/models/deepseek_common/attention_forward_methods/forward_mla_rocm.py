@@ -1266,6 +1266,9 @@ class DeepseekMLARocmForwardMixin:
         # The platform term goes first: other platforms never look up the KV pool.
         return (
             _use_gfx1250_fused_mla_rope
+            # The fused kernel writes token-major KV rows; the asm decode
+            # pool is seg-packed, so its writes go through the pool.
+            and not envs.SGLANG_AITER_MLA_GFX1250_ASM.get()
             and forward_batch.forward_mode.is_decode()
             and self.current_attention_backend in _GFX1250_FUSED_ROPE_BACKENDS
             and not self.use_dsa
