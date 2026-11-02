@@ -652,6 +652,13 @@ class Envs:
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
+    # Attention (aiter, ROCm): on gfx1250, cast MLA prefill q/k/v to fp8 e4m3
+    # with scale 1 (as the gfx950 asm fp8 prefill does) so aiter's FlyDSL a8w8
+    # kernel serves the varlen attention instead of the bf16 asm kernel. Needs
+    # ROCm/aiter#6702. Default off. Temporary opt-in until gfx1250 GSM8K and
+    # perf are validated; then SGLANG_AITER_FP8_PREFILL_ATTN takes it over
+    # (gfx950 keeps the asm path, gfx1250 the FlyDSL one) and this goes away.
+    SGLANG_AITER_GFX1250_FP8_PREFILL_ATTN = EnvBool(False)
     # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
     # gfx950 fp8 hd256 takes aiter's paged-varlen asm kernel. That kernel is
     # compiled for 4D LINEAR [N, 64, H, D], so it serves --page-size 64 and

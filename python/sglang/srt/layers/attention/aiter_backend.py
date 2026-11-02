@@ -44,7 +44,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
 )
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -500,6 +500,17 @@ class AiterAttnBackend(AttentionBackend):
                 f"{self.fp8_prefill_num_head}; mla_reduce_v1 has no "
                 f"{self.num_head}-head instantiation at head_dim {self.v_head_dim}."
             )
+        self.use_gfx1250_fp8_prefill_attn = (
+            self.use_mla
+            and envs.SGLANG_AITER_GFX1250_FP8_PREFILL_ATTN.get()
+            and is_gfx1250_supported()
+        )
+        if self.use_gfx1250_fp8_prefill_attn:
+            # flash_attn_varlen_func would hand fp8 inputs FlyDSL turns down
+            # to Triton; this entry returns None for them instead.
+            from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
+
+            self.flydsl_varlen_fwd = flydsl_flash_attn_varlen_fwd
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
@@ -1918,6 +1929,21 @@ class AiterAttnBackend(AttentionBackend):
             return_lse=True,
         )
         return merge_state_triton(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
+
+    def _mla_prefill_varlen(self, q, k, v, *args, **kwargs):
+        """flash_attn_varlen_func, run in fp8 on gfx1250 when enabled.
+
+        The cast uses scale 1, as _mla_fp8_prefill_attn_ps does. The a8w8
+        kernel writes bf16, so other query dtypes stay on the bf16 path, as do
+        shapes the FlyDSL entry turns down.
+        """
+        if self.use_gfx1250_fp8_prefill_attn and q.dtype == torch.bfloat16:
+            out = self.flydsl_varlen_fwd(
+                q.to(fp8_dtype), k.to(fp8_dtype), v.to(fp8_dtype), *args, **kwargs
+            )
+            if out is not None:
+                return out
+        return flash_attn_varlen_func(q, k, v, *args, **kwargs)
 
     def mla_fp8_prefill_attn(
         self,
@@ -3696,7 +3722,7 @@ class AiterAttnBackend(AttentionBackend):
         if ps_metadatas is not None and ps_metadatas[idx] is not None:
             return self._mla_fp8_prefill_attn_ps(q, k, v, layer, ps_metadatas[idx])
 
-        output, lse = flash_attn_varlen_func(
+        output, lse = self._mla_prefill_varlen(
             q,
             k,
             v,
@@ -3725,7 +3751,7 @@ class AiterAttnBackend(AttentionBackend):
 
         qo_indptr = self.forward_metadata.qo_indptr
         max_q_len = self.forward_metadata.max_q_len
-        output, lse = flash_attn_varlen_func(
+        output, lse = self._mla_prefill_varlen(
             q,
             k,
             v,
@@ -3933,7 +3959,7 @@ class AiterAttnBackend(AttentionBackend):
                 if self.dcp_world_size > 1:
                     if self.use_fp8_prefill_attn:
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
-                    return flash_attn_varlen_func(
+                    return self._mla_prefill_varlen(
                         q,
                         k,
                         v,
@@ -3953,7 +3979,7 @@ class AiterAttnBackend(AttentionBackend):
                             layer,
                         )
                     else:
-                        output = flash_attn_varlen_func(
+                        output = self._mla_prefill_varlen(
                             q,
                             k,
                             v,
@@ -4021,7 +4047,7 @@ class AiterAttnBackend(AttentionBackend):
                     if self.use_fp8_prefill_attn:
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     else:
-                        return flash_attn_varlen_func(
+                        return self._mla_prefill_varlen(
                             q,
                             k,
                             v,
