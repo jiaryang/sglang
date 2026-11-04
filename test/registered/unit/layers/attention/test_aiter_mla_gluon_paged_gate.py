@@ -233,6 +233,14 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
         self.assertIs(self._decode(backend, _layer(), 1), self.asm_out)
         self.assertEqual(self.kernel.calls, [])
 
+    def test_soft_capped_layer_runs_the_asm_decode(self):
+        """The paged kernel has no soft cap and would silently drop it; the ASM
+        decode takes logit_cap and rejects what it cannot apply."""
+        layer = _layer()
+        layer.logit_cap = 30.0
+        self.assertIs(self._decode(_backend(), layer, 1), self.asm_out)
+        self.assertEqual(self.kernel.calls, [])
+
     def test_kv_descale_matches_the_asm_decode(self):
         """The MLA store writes K unscaled; only an fp8 cache takes the k_scale."""
         for name, kv_dtype, layer_k_scale, expected in (

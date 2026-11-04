@@ -1663,7 +1663,8 @@ class AiterAttnBackend(AttentionBackend):
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
         fm = self.forward_metadata
-        if fm.paged_mla_block_tables is not None:
+        # The paged kernel has no soft cap; mla_decode_fwd rejects one.
+        if fm.paged_mla_block_tables is not None and not layer.logit_cap:
             o = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                 dtype=self.input_dtype,
