@@ -41,7 +41,7 @@ def _gluon_fn():
         logger.info("aiter mla gluon is disabled manually.")
         return None
     if is_gfx1250_supported():
-        logger.info("aiter mla gluon is disabled on gfx1250, which uses paged Gluon.")
+        logger.info("aiter mla gluon is disabled on gfx1250.")
         return None
     try:
         import triton

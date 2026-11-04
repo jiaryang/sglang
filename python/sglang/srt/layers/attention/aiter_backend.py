@@ -724,6 +724,10 @@ class AiterAttnBackend(AttentionBackend):
                     dcp_world_size=self.dcp_world_size,
                     qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
                 )
+                logger.info(
+                    "aiter paged MLA Gluon decode on gfx1250 is %s",
+                    "enabled" if self.use_paged_mla_gluon_decode else "disabled",
+                )
             # gfx950 mla_gluon is off on gfx1250 (_gluon_fn).
             # Its capability log would report the zero-pad fallback,
             # which gfx1250 paged decode does not take.
