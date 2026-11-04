@@ -161,6 +161,7 @@ def supports_paged_mla_gluon_decode(
         envs.SGLANG_AITER_MLA_GLUON.get()
         and is_gfx1250_supported()
         and input_dtype == torch.bfloat16
+        # BailingMoeV3 with use_mla_nope sets 0, a shape the kernel cannot take.
         and qk_rope_head_dim > 0
         # The only page size aiter's test_mla_decode_fwd covers for bf16/fp8 KV.
         and page_size == 64

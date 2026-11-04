@@ -1141,7 +1141,8 @@ class Envs:
     SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
     # Route MLA decode through aiter Triton Gluon when its prerequisites hold:
     # Kimi-K3-style h12 + fp8 on gfx950 and paged MLA on gfx1250. Set to 0 to force
-    # the aiter ASM mla_decode_fwd fallback on both (benchmarking / emergency disable).
+    # the aiter ASM mla_decode_fwd (benchmarking / emergency disable). The gfx1250
+    # ASM kernels take an fp8 Q only, so bf16 MLA decode has no fallback there.
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
     # Select the AITER MLA kernel for decode, "asm" or "gluon".
     SGLANG_AITER_MLA_DECODE_BACKEND = EnvStrWithAlias(
