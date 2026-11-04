@@ -1139,12 +1139,15 @@ class Envs:
     # 288 GB MI355 in nightly-4-gpu-mi35x-minimax-m3). Worth setting only when the
     # scaled fraction is itself too small to hold the model weights.
     SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
-    # Route MLA decode through aiter Triton Gluon when its prerequisites hold:
-    # Kimi-K3-style h12 + fp8 on gfx950 and paged MLA on gfx1250. Set to 0 to force
-    # the aiter ASM mla_decode_fwd (benchmarking / emergency disable). The gfx1250
-    # ASM kernels take an fp8 Q only, so bf16 MLA decode has no fallback there.
+    # Route MLA decode through aiter's Triton Gluon kernels when their prerequisites
+    # hold: Kimi-K3-style h12 + fp8 KV on gfx950, and bf16 single-token decode with
+    # page size 64 and no DCP on gfx1250. Set to 0 to force the ASM
+    # aiter.mla.mla_decode_fwd (benchmarking / emergency disable). The gfx1250 ASM
+    # kernels take an fp8 Q only, so bf16 decode fails there, as on main.
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
-    # Select the AITER MLA kernel for decode, "asm" or "gluon".
+    # Which AITER MLA decode kernel to prefer, "asm" or "gluon", when both can serve
+    # the batch (gfx950 h12 fp8); with DCP it picks the kernel outright. gfx1250
+    # non-DCP decode ignores it: the ASM kernels there take an fp8 Q only.
     SGLANG_AITER_MLA_DECODE_BACKEND = EnvStrWithAlias(
         "asm", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
     )

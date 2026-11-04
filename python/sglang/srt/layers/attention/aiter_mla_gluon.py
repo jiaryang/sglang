@@ -6,7 +6,7 @@ Two independent kernels, both turned off by ``SGLANG_AITER_MLA_GLUON=0``:
   (e.g. Kimi K3 TP8, 12 heads/GPU) over token-level kv_indices. Needs aiter with
   ROCm/aiter #4480 (batch>1 ``bh16bn128``) and #4555 (decode CUDA graph KV splits)
   and Triton >= 3.7 (Gluon ``cga_layout``); otherwise the caller zero-pads heads
-  for ``mla_decode_fwd``.
+  for the ASM ``aiter.mla.mla_decode_fwd``.
 - gfx1250: ``aiter.ops.triton.attention.mla.mla_decode_fwd``, which runs aiter's
   gfx1250 Gluon MLA kernels, over paged block tables with a bf16 query. Needs
   aiter with ROCm/aiter#5935.
@@ -41,7 +41,9 @@ def _gluon_fn():
         logger.info("aiter mla gluon is disabled manually.")
         return None
     if is_gfx1250_supported():
-        logger.info("aiter mla gluon is disabled on gfx1250.")
+        logger.info(
+            "aiter mla_gluon is unavailable on gfx1250: the kernel requires gfx950."
+        )
         return None
     try:
         import triton
@@ -146,7 +148,7 @@ def mla_gluon_decode(
     return out, lse
 
 
-# ===== gfx1250: paged mla_decode_fwd =====
+# ===== gfx1250: paged MLA decode (aiter Triton mla_decode_fwd) =====
 
 
 def supports_paged_mla_gluon_decode(
@@ -203,10 +205,11 @@ def paged_mla_gluon_decode(
     q is [bs, H, kv_lora_rank + qk_rope_head_dim] and kv_buffer the layer's MLA
     key buffer [num_slots, 1, kv_lora_rank + qk_rope_head_dim]. The kernel reads
     only the first cdiv(seq_len, page_size) entries of each block_tables row.
+    Runs aiter's Triton ``mla_decode_fwd``; on gfx1250 its decode kernel is Gluon.
     """
-    from aiter.ops.triton.attention.mla import mla_decode_fwd
+    from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 
-    mla_decode_fwd(
+    triton_mla_decode_fwd(
         q=q,
         kv_buffer=kv_buffer.view(
             -1, page_size, kv_buffer.shape[-2], kv_buffer.shape[-1]

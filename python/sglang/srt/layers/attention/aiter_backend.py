@@ -264,7 +264,8 @@ class ForwardMetadata:
     cprr_empty_rows: Optional[torch.Tensor] = None
     # paged_attention_ragged grid size; None means max_num_partitions.
     decode_num_partitions: Optional[int] = None
-    # gfx1250 paged Gluon MLA decode; None runs MLA decode on mla_decode_fwd.
+    # gfx1250 paged Gluon MLA decode; None: MLA decode takes the ASM /
+    # gfx950 mla_gluon dispatch.
     paged_mla_block_tables: Optional[torch.Tensor] = None
     paged_mla_seq_lens: Optional[torch.Tensor] = None
 
@@ -725,8 +726,13 @@ class AiterAttnBackend(AttentionBackend):
                     qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
                 )
                 logger.info(
-                    "aiter paged MLA Gluon decode on gfx1250 is %s",
-                    "enabled" if self.use_paged_mla_gluon_decode else "disabled",
+                    "aiter gfx1250 paged MLA Gluon decode is %s",
+                    (
+                        "enabled"
+                        if self.use_paged_mla_gluon_decode
+                        else "disabled (needs SGLANG_AITER_MLA_GLUON=1, bf16 "
+                        "activations, page size 64, no DCP, qk_rope_head_dim > 0)"
+                    ),
                 )
             # gfx950 mla_gluon is off on gfx1250 (_gluon_fn).
             # Its capability log would report the zero-pad fallback,
@@ -844,7 +850,8 @@ class AiterAttnBackend(AttentionBackend):
     def _uses_paged_mla_gluon_decode(
         self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
     ) -> bool:
-        """One query token per sequence; the rest runs mla_decode_fwd."""
+        """Per batch: single-token, non-speculative decode when use_paged_mla_gluon_decode
+        holds (gfx1250); other batches take the existing MLA decode dispatch."""
         return (
             self.use_paged_mla_gluon_decode
             and spec_info is None
@@ -1660,7 +1667,7 @@ class AiterAttnBackend(AttentionBackend):
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
         fm = self.forward_metadata
-        # The paged kernel has no soft cap; mla_decode_fwd rejects one.
+        # The paged kernel has no soft cap; the ASM mla_decode_fwd asserts on one.
         if fm.paged_mla_block_tables is not None and not layer.logit_cap:
             o = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
