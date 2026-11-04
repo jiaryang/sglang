@@ -7,8 +7,9 @@ Two independent kernels, both turned off by ``SGLANG_AITER_MLA_GLUON=0``:
   ROCm/aiter #4480 (batch>1 ``bh16bn128``) and #4555 (decode CUDA graph KV splits)
   and Triton >= 3.7 (Gluon ``cga_layout``); otherwise the caller zero-pads heads
   for ``mla_decode_fwd``.
-- gfx1250: ``aiter.ops.triton.attention.mla.mla_decode_fwd`` over paged block
-  tables with a bf16 query. Needs aiter with ROCm/aiter#5935.
+- gfx1250: ``aiter.ops.triton.attention.mla.mla_decode_fwd``, which runs aiter's
+  gfx1250 Gluon MLA kernels, over paged block tables with a bf16 query. Needs
+  aiter with ROCm/aiter#5935.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -25,9 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx1250_supported
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -150,114 +149,78 @@ def mla_gluon_decode(
 # ===== gfx1250: paged mla_decode_fwd =====
 
 
-@functools.lru_cache(maxsize=1)
-def _paged_mla_decode_fwd() -> Optional[Callable]:
-    if not envs.SGLANG_AITER_MLA_GLUON.get():
-        return None
+def supports_paged_mla_gluon_decode(
+    *,
+    input_dtype: torch.dtype,
+    page_size: int,
+    dcp_world_size: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Whether single-token MLA decode runs ``paged_mla_gluon_decode``."""
+    return (
+        envs.SGLANG_AITER_MLA_GLUON.get()
+        and is_gfx1250_supported()
+        and input_dtype == torch.bfloat16
+        and qk_rope_head_dim > 0
+        # The only page size aiter's test_mla_decode_fwd covers for bf16/fp8 KV.
+        and page_size == 64
+        and dcp_world_size == 1
+    )
+
+
+def paged_mla_block_tables(
+    *,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    max_kv_len: int,
+    page_size: int,
+) -> torch.Tensor:
+    """[bs, cdiv(max_kv_len, page_size)] page ids of each request.
+
+    The paged allocator keeps a page's slots contiguous, so a page id is the
+    slot of the page's first token divided by the page size.
+    """
+    return req_to_token[req_pool_indices, :max_kv_len:page_size] // page_size
+
+
+def paged_mla_gluon_decode(
+    *,
+    q: torch.Tensor,
+    o: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    page_size: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sm_scale: float,
+    kv_descale: Optional[torch.Tensor],
+) -> None:
+    """Decode one query token per sequence into ``o`` [bs, H, kv_lora_rank].
+
+    q is [bs, H, kv_lora_rank + qk_rope_head_dim] and kv_buffer the layer's MLA
+    key buffer [num_slots, 1, kv_lora_rank + qk_rope_head_dim]. The kernel reads
+    only the first cdiv(seq_len, page_size) entries of each block_tables row.
+    """
     from aiter.ops.triton.attention.mla import mla_decode_fwd
 
-    return mla_decode_fwd
-
-
-class PagedGluonMlaDecode:
-    """gfx1250 paged Gluon MLA decode state of one attention backend."""
-
-    @classmethod
-    def create(
-        cls, backend: AiterAttnBackend, *, kv_lora_rank: int, qk_rope_head_dim: int
-    ) -> Optional[PagedGluonMlaDecode]:
-        """None unless the backend settings fit the kernel."""
-        if not (
-            backend.input_dtype == torch.bfloat16
-            and qk_rope_head_dim > 0
-            # The only page size aiter's test_mla_decode_fwd covers for bf16/fp8 KV.
-            and backend.page_size == 64
-            and backend.dcp_world_size == 1
-        ):
-            return None
-        fwd = _paged_mla_decode_fwd()
-        if fwd is None:
-            return None
-        return cls(
-            backend,
-            mla_decode_fwd=fwd,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-        )
-
-    def __init__(
-        self,
-        backend: AiterAttnBackend,
-        *,
-        mla_decode_fwd: Callable,
-        kv_lora_rank: int,
-        qk_rope_head_dim: int,
-    ):
-        self.mla_decode_fwd = mla_decode_fwd
-        # Held for kv_layers: a frozen-KV MTP draft swaps the backend's pool.
-        self.backend = backend
-        self.req_to_token = backend.req_to_token
-        self.page_size = backend.page_size
-        # First layer that runs this kernel; accepts() depends only on the batch,
-        # so it never moves.
-        self.first_layer_id: Optional[int] = None
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.page_starts = torch.arange(
-            0, self.req_to_token.shape[1], self.page_size, device=backend.device
-        )
-        self.block_tables: Optional[torch.Tensor] = None
-        self.seq_lens: Optional[torch.Tensor] = None
-        self.cu_seqlens_q: Optional[torch.Tensor] = None
-
-    def accepts(self, forward_batch: ForwardBatch) -> bool:
-        """One query token per sequence; the caller runs the rest on ASM."""
-        return (
-            forward_batch.spec_info is None and forward_batch.forward_mode.is_decode()
-        )
-
-    def forward(
-        self,
-        *,
-        q: torch.Tensor,
-        o: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        kv_descale: Optional[torch.Tensor],
-    ):
-        # Page table and lengths are per forward: rebuilt at the first kernel layer
-        # from graph-static batch tensors, so CUDA graph replay refreshes them.
-        if self.first_layer_id is None:
-            self.first_layer_id = layer.layer_id
-        if layer.layer_id == self.first_layer_id:
-            bs = forward_batch.batch_size
-            self.block_tables = (
-                self.req_to_token[
-                    forward_batch.req_pool_indices[:bs, None],
-                    self.page_starts[None, :],
-                ]
-                // self.page_size
-            )
-            self.seq_lens = forward_batch.seq_lens[:bs].to(torch.int32)
-            self.cu_seqlens_q = torch.arange(bs + 1, dtype=torch.int32, device=q.device)
-        kv_buffer = self.backend.kv_layers.read(layer.layer_id).key()
-        kv_buffer = kv_buffer.view(
-            -1, self.page_size, kv_buffer.shape[-2], kv_buffer.shape[-1]
-        )
-        self.mla_decode_fwd(
-            q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            kv_buffer=kv_buffer,
-            out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            cu_seqlens_q=self.cu_seqlens_q,
-            seqused_k=self.seq_lens,
-            # 0: the kernel sizes its KV split from a fixed guess, which keeps
-            # CUDA graph replay valid for any sequence length.
-            max_seqlen_kv=0,
-            block_tables=self.block_tables,
-            softmax_scale=layer.scaling,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            causal=True,
-            q_descale=None,
-            kv_descale=kv_descale,
-        )
+    mla_decode_fwd(
+        q=q,
+        kv_buffer=kv_buffer.view(
+            -1, page_size, kv_buffer.shape[-2], kv_buffer.shape[-1]
+        ),
+        out=o,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens,
+        # 0: the kernel sizes its KV split from a fixed guess, which keeps
+        # CUDA graph replay valid for any sequence length.
+        max_seqlen_kv=0,
+        block_tables=block_tables,
+        softmax_scale=sm_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        causal=True,
+        q_descale=None,
+        kv_descale=kv_descale,
+    )

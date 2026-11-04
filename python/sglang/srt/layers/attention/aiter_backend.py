@@ -92,10 +92,12 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_qua
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_mla_gluon import (
-    PagedGluonMlaDecode,
     log_mla_gluon_capability,
     mla_gluon_decode,
+    paged_mla_block_tables,
+    paged_mla_gluon_decode,
     prefer_mla_gluon_decode,
+    supports_paged_mla_gluon_decode,
 )
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
@@ -262,6 +264,9 @@ class ForwardMetadata:
     cprr_empty_rows: Optional[torch.Tensor] = None
     # paged_attention_ragged grid size; None means max_num_partitions.
     decode_num_partitions: Optional[int] = None
+    # gfx1250 paged Gluon MLA decode; None runs MLA decode on mla_decode_fwd.
+    paged_mla_block_tables: Optional[torch.Tensor] = None
+    paged_mla_seq_lens: Optional[torch.Tensor] = None
 
 
 def _build_paged_kv_view(
@@ -560,7 +565,7 @@ class AiterAttnBackend(AttentionBackend):
             self.swa_kv_pool is not None
             and self.swa_kv_pool.layer_router.routes_to(IdSpaceKind.SLIDING_WINDOW)
         )
-        self.paged_gluon_mla_decode: Optional[PagedGluonMlaDecode] = None
+        self.use_paged_mla_gluon_decode = False
 
         # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
         # we (a) skip the launch_reshape_and_cache_flash shortcut and always go
@@ -712,13 +717,21 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
-            # Must run before use_any_mla_persist: it may turn the PS kernel off.
-            if is_gfx1250_supported():
-                self.paged_gluon_mla_decode = self._create_paged_gluon_mla_decode(
-                    kv_lora_rank=model_runner.model_config.kv_lora_rank,
-                    qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
-                )
-            elif self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
+            # MLA decode passes a bf16 Q outside DCP, and aiter's default
+            # persistent MLA decode kernels for gfx1250 (hsa/gfx1250/mla_dsl)
+            # take an fp8 Q only; hsa/gfx1250/mla has no persistent kernel.
+            # DCP quantizes Q to fp8 and keeps them.
+            if is_gfx1250_supported() and self.dcp_world_size == 1:
+                _use_mla_ps_kernel = False
+                fast_mode = False
+                intra_batch_mode = False
+            self.use_paged_mla_gluon_decode = supports_paged_mla_gluon_decode(
+                input_dtype=self.input_dtype,
+                page_size=self.page_size,
+                dcp_world_size=self.dcp_world_size,
+                qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
+            )
+            if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel
                 if (
@@ -828,24 +841,15 @@ class AiterAttnBackend(AttentionBackend):
         )
         return q_fp8.view(q.shape), self.q_scale
 
-    def _create_paged_gluon_mla_decode(
-        self, *, kv_lora_rank: int, qk_rope_head_dim: int
-    ) -> Optional[PagedGluonMlaDecode]:
-        """gfx1250 paged Gluon MLA decode, or None when it does not fit.
-
-        When created it turns the PS kernel off: aiter ships no persistent-scheduling
-        MLA ASM kernel for gfx1250, and the paged kernel serves decode only, so
-        verify and draft extend run the non-persist ASM decode.
-        """
-        global _use_mla_ps_kernel, fast_mode, intra_batch_mode
-        paged = PagedGluonMlaDecode.create(
-            self, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
+    def _uses_paged_mla_gluon_decode(
+        self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
+    ) -> bool:
+        """One query token per sequence; the rest runs mla_decode_fwd."""
+        return (
+            self.use_paged_mla_gluon_decode
+            and spec_info is None
+            and forward_mode.is_decode()
         )
-        if paged is not None:
-            _use_mla_ps_kernel = False
-            fast_mode = False
-            intra_batch_mode = False
-        return paged
 
     def _use_mla_decode_persist_metadata(self) -> bool:
         """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
@@ -1655,17 +1659,23 @@ class AiterAttnBackend(AttentionBackend):
         k_buffer = self.kv_layers.read(layer.layer_id).key()
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        paged = self.paged_gluon_mla_decode
-        if paged is not None and paged.accepts(forward_batch=forward_batch):
+        fm = self.forward_metadata
+        if fm.paged_mla_block_tables is not None:
             o = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                 dtype=self.input_dtype,
             )
-            paged.forward(
+            paged_mla_gluon_decode(
                 q=q,
                 o=o,
-                layer=layer,
-                forward_batch=forward_batch,
+                kv_buffer=k_buffer,
+                block_tables=fm.paged_mla_block_tables,
+                seq_lens=fm.paged_mla_seq_lens,
+                cu_seqlens_q=fm.qo_indptr,
+                page_size=self.page_size,
+                kv_lora_rank=layer.v_head_dim,
+                qk_rope_head_dim=layer.qk_head_dim - layer.v_head_dim,
+                sm_scale=layer.scaling,
                 kv_descale=k_descale,
             )
             return o
@@ -2224,6 +2234,7 @@ class AiterAttnBackend(AttentionBackend):
         global_kv_indptr = None
         use_asm_cprr_verify = False
         cprr_kv_indices = cprr_kv_indptr = cprr_empty_rows = None
+        paged_mla_tables = paged_mla_seq_lens = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -2308,6 +2319,21 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.kv_last_page_len[:bs]
                 max_q_len = 1
 
+                if self._uses_paged_mla_gluon_decode(
+                    forward_batch.forward_mode, spec_info
+                ):
+                    paged_mla_tables = paged_mla_block_tables(
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices[:bs],
+                        max_kv_len=(
+                            self.req_to_token.shape[1]
+                            if max_kv_len is None
+                            else max_kv_len
+                        ),
+                        page_size=self.page_size,
+                    )
+                    paged_mla_seq_lens = forward_batch.seq_lens[:bs].to(torch.int32)
+
                 if self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
@@ -2366,6 +2392,8 @@ class AiterAttnBackend(AttentionBackend):
                     if spec_info is None
                     else None
                 ),
+                paged_mla_block_tables=paged_mla_tables,
+                paged_mla_seq_lens=paged_mla_seq_lens,
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -3008,6 +3036,16 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        if self.use_paged_mla_gluon_decode:
+            self.cuda_graph_paged_mla_block_tables = torch.zeros(
+                (max_bs, triton.cdiv(self.req_to_token.shape[1], self.page_size)),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.cuda_graph_paged_mla_seq_lens = torch.zeros(
+                (max_bs,), dtype=torch.int32, device=self.device
+            )
+
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
@@ -3127,6 +3165,7 @@ class AiterAttnBackend(AttentionBackend):
         use_asm_cprr_verify = False
 
         swa_page_table = None
+        paged_mla_tables = paged_mla_seq_lens = None
         # Unified verify never reads this host max (replay sizes from
         # max_context_len); torch.max(seq_lens).item() would sync every replay.
         max_kv_len = (
@@ -3232,6 +3271,19 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
 
+                if self._uses_paged_mla_gluon_decode(forward_mode, spec_info):
+                    # Columns past max_kv_len keep stale ids the kernel never reads.
+                    paged_mla_tables = self.cuda_graph_paged_mla_block_tables[:bs]
+                    tables = paged_mla_block_tables(
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=req_pool_indices[:bs],
+                        max_kv_len=max_kv_len,
+                        page_size=self.page_size,
+                    )
+                    paged_mla_tables[:, : tables.shape[1]].copy_(tables)
+                    paged_mla_seq_lens = self.cuda_graph_paged_mla_seq_lens[:bs]
+                    paged_mla_seq_lens.copy_(seq_lens[:bs])
+
                 if self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
@@ -3278,6 +3330,8 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 swa_page_table=swa_page_table,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
+                paged_mla_block_tables=paged_mla_tables,
+                paged_mla_seq_lens=paged_mla_seq_lens,
             )
 
         elif forward_mode.is_target_verify():

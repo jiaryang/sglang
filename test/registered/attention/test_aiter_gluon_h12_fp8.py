@@ -237,7 +237,6 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
         be = AiterAttnBackend.__new__(AiterAttnBackend)
-        be.paged_gluon_mla_decode = None
         be.num_head = 12
         be.kv_cache_dtype = fp8_dtype
         be.head_pad_mode = "zero"
@@ -259,6 +258,7 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
             reduce_final_map=None,
             reduce_partial_map=None,
             num_kv_splits=None,
+            paged_mla_block_tables=None,
         )
         be.token_to_kv_pool = mock.Mock(
             get_key_buffer=lambda _lid: torch.zeros(8, 576, dtype=fp8_dtype)
