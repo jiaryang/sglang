@@ -734,9 +734,8 @@ class AiterAttnBackend(AttentionBackend):
                         "activations, page size 64, no DCP, qk_rope_head_dim > 0)"
                     ),
                 )
-            # gfx950 mla_gluon is off on gfx1250 (_gluon_fn).
-            # Its capability log would report the zero-pad fallback,
-            # which gfx1250 paged decode does not take.
+            # gfx1250 does not use mla_gluon (_gluon_fn), so the gfx950 PS switch
+            # and capability log below are skipped there.
             elif self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel

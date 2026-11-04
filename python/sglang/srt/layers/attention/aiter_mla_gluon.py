@@ -7,9 +7,9 @@ Two independent kernels, both turned off by ``SGLANG_AITER_MLA_GLUON=0``:
   ROCm/aiter #4480 (batch>1 ``bh16bn128``) and #4555 (decode CUDA graph KV splits)
   and Triton >= 3.7 (Gluon ``cga_layout``); otherwise the caller zero-pads heads
   for the ASM ``aiter.mla.mla_decode_fwd``.
-- gfx1250: ``aiter.ops.triton.attention.mla.mla_decode_fwd``, which runs aiter's
-  gfx1250 Gluon MLA kernels, over paged block tables with a bf16 query. Needs
-  aiter with ROCm/aiter#5935.
+- gfx1250: ``aiter.ops.triton.attention.mla.mla_decode_fwd``, whose decode kernel
+  on gfx1250 is Gluon, over paged block tables with a bf16 query. Needs aiter
+  with ROCm/aiter#5935.
 """
 
 from __future__ import annotations

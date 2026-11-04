@@ -122,7 +122,8 @@ class TestSupportsPagedMlaGluonDecode(CustomTestCase):
 
     def test_settings_the_kernel_cannot_serve_decline(self):
         """Only page size 64 is validated; fp16 activations would be run as bf16,
-        DCP needs aiter's own CP path, a 0 rope dim is a kernel shape error, and
+        DCP decode runs _forward_decode_dcp, which needs an LSE this kernel does not
+        return, a 0 rope dim is a kernel shape error, and
         SGLANG_AITER_MLA_GLUON=0 turns every aiter Gluon MLA decode off."""
         for kwargs in (
             dict(page_size=1),
@@ -189,6 +190,14 @@ class TestUsesPagedMlaGluonDecode(CustomTestCase):
 
 _SPLIT_PAGES = [[3, 5, 7, 9], [2, 4, 6, 8]]
 _SPLIT_SEQ_LENS = [100, 64]
+_PERSIST_FIELDS = (
+    "work_metadata",
+    "work_info_set",
+    "work_indptr",
+    "reduce_indptr",
+    "reduce_final_map",
+    "reduce_partial_map",
+)
 
 
 class _NoopKernel:
@@ -229,14 +238,7 @@ def _metadata_backend(paged):
         (bs, len(_SPLIT_PAGES[0])), dtype=torch.int32
     )
     backend.cuda_graph_paged_mla_seq_lens = torch.zeros(bs, dtype=torch.int32)
-    for name in (
-        "work_metadata",
-        "work_info_set",
-        "work_indptr",
-        "reduce_indptr",
-        "reduce_final_map",
-        "reduce_partial_map",
-    ):
+    for name in _PERSIST_FIELDS:
         setattr(backend, name, torch.zeros(1, dtype=torch.int32))
     backend.make_mla_decode_meta_data_buffer = mock.Mock(
         side_effect=lambda *args, **kwargs: tuple(
@@ -302,6 +304,10 @@ class TestPagedMlaDecodeMetadataSplit(CustomTestCase):
         paged = _metadata_backend(paged=True)
         paged.init_forward_metadata(_decode_batch())
         self._assert_paged(paged)
+        self.assertEqual(
+            paged.forward_metadata.paged_mla_block_tables.shape[1],
+            -(-max(_SPLIT_SEQ_LENS) // _PAGE_SIZE),
+        )
 
         persist = _metadata_backend(paged=False)
         persist.init_forward_metadata(_decode_batch())
@@ -324,15 +330,19 @@ class TestPagedMlaDecodeMetadataSplit(CustomTestCase):
                     verify_tokens_per_req=None,
                 )
                 check(backend)
+                fm = backend.forward_metadata
                 if paged:
                     self.assertEqual(
-                        backend.forward_metadata.paged_mla_block_tables.data_ptr(),
+                        fm.paged_mla_block_tables.data_ptr(),
                         backend.cuda_graph_paged_mla_block_tables.data_ptr(),
                     )
-                else:
-                    self.assertIs(
-                        backend.forward_metadata.work_metadata, backend.work_metadata
+                    self.assertEqual(
+                        fm.paged_mla_seq_lens.data_ptr(),
+                        backend.cuda_graph_paged_mla_seq_lens.data_ptr(),
                     )
+                else:
+                    for name in _PERSIST_FIELDS:
+                        self.assertIs(getattr(fm, name), getattr(backend, name))
 
 
 class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
