@@ -169,7 +169,7 @@ class TestPagedMlaBlockTables(CustomTestCase):
 class TestUsesPagedMlaGluonDecode(CustomTestCase):
     def test_only_single_token_decode_runs_the_paged_kernel(self):
         """Verify and draft extend carry several query tokens per sequence; they
-        must keep running mla_decode_fwd."""
+        must keep running the ASM mla_decode_fwd."""
         backend = aiter_backend.AiterAttnBackend.__new__(aiter_backend.AiterAttnBackend)
         for name, enabled, mode, spec_info, expected in (
             ("decode", True, ForwardMode.DECODE, None, True),
@@ -185,6 +185,154 @@ class TestUsesPagedMlaGluonDecode(CustomTestCase):
                 self.assertIs(
                     backend._uses_paged_mla_gluon_decode(mode, spec_info), expected
                 )
+
+
+_SPLIT_PAGES = [[3, 5, 7, 9], [2, 4, 6, 8]]
+_SPLIT_SEQ_LENS = [100, 64]
+
+
+class _NoopKernel:
+    def __getitem__(self, _grid):
+        return lambda *_args, **_kwargs: None
+
+
+def _metadata_backend(paged):
+    """An MLA AiterAttnBackend holding only what decode metadata reads, PS on."""
+    bs = len(_SPLIT_PAGES)
+    max_context_len = len(_SPLIT_PAGES[0]) * _PAGE_SIZE
+    backend = aiter_backend.AiterAttnBackend.__new__(aiter_backend.AiterAttnBackend)
+    backend.device = torch.device("cpu")
+    backend.use_mla = True
+    backend.use_paged_mla_gluon_decode = paged
+    backend.decode_uses_page_table = False
+    backend.use_sliding_window_kv_pool = False
+    backend.dcp_world_size = 1
+    backend.use_mla_dcp_asm = False
+    backend.page_size = _PAGE_SIZE
+    backend.max_context_len = max_context_len
+    backend.max_split_per_batch = 16
+    backend.max_num_partitions = 1
+    backend._decode_partition_buckets = []
+    backend._kv_indices_scratch = None
+    backend.req_to_token = torch.stack(
+        [
+            torch.cat([p * _PAGE_SIZE + torch.arange(_PAGE_SIZE) for p in row])
+            for row in _SPLIT_PAGES
+        ]
+    ).to(torch.int32)
+    backend.kv_indptr = torch.zeros(bs + 1, dtype=torch.int32)
+    backend.qo_indptr_ = torch.zeros(bs + 1, dtype=torch.int32)
+    backend.kv_last_page_len = torch.ones(bs, dtype=torch.int32)
+    backend.cuda_graph_kv_last_page_len = torch.ones(bs, dtype=torch.int32)
+    backend.cuda_graph_kv_indices = torch.zeros(bs * max_context_len, dtype=torch.int32)
+    backend.cuda_graph_paged_mla_block_tables = torch.zeros(
+        (bs, len(_SPLIT_PAGES[0])), dtype=torch.int32
+    )
+    backend.cuda_graph_paged_mla_seq_lens = torch.zeros(bs, dtype=torch.int32)
+    for name in (
+        "work_metadata",
+        "work_info_set",
+        "work_indptr",
+        "reduce_indptr",
+        "reduce_final_map",
+        "reduce_partial_map",
+    ):
+        setattr(backend, name, torch.zeros(1, dtype=torch.int32))
+    backend.make_mla_decode_meta_data_buffer = mock.Mock(
+        side_effect=lambda *args, **kwargs: tuple(
+            torch.zeros(1, dtype=torch.int32) for _ in range(6)
+        )
+    )
+    backend.make_mla_meta_data = mock.Mock()
+    return backend
+
+
+def _decode_batch():
+    seq_lens = torch.tensor(_SPLIT_SEQ_LENS, dtype=torch.int64)
+    return types.SimpleNamespace(
+        batch_size=len(_SPLIT_SEQ_LENS),
+        req_pool_indices=torch.arange(len(_SPLIT_SEQ_LENS)),
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        seq_lens_sum=int(seq_lens.sum()),
+        spec_info=None,
+        forward_mode=ForwardMode.DECODE,
+        out_cache_loc=None,
+    )
+
+
+class TestPagedMlaDecodeMetadataSplit(CustomTestCase):
+    """A decode batch the paged kernel takes gets a page table and no persist
+    metadata; with the capability off the same batch still builds PS metadata."""
+
+    def setUp(self):
+        for target, replacement in (
+            ("reset_verify_attn_plan_cache", lambda: None),
+            ("create_flashinfer_kv_indices_triton", _NoopKernel()),
+            ("_use_mla_ps_kernel", True),
+        ):
+            patcher = mock.patch.object(aiter_backend, target, replacement, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _assert_paged(self, backend):
+        fm = backend.forward_metadata
+        width = -(-max(_SPLIT_SEQ_LENS) // _PAGE_SIZE)
+        torch.testing.assert_close(
+            fm.paged_mla_block_tables[:, :width],
+            torch.tensor([row[:width] for row in _SPLIT_PAGES], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            fm.paged_mla_seq_lens,
+            torch.tensor(_SPLIT_SEQ_LENS, dtype=torch.int32),
+        )
+        self.assertIsNone(fm.work_metadata)
+        self.assertIsNone(fm.reduce_indptr)
+        backend.make_mla_decode_meta_data_buffer.assert_not_called()
+        backend.make_mla_meta_data.assert_not_called()
+
+    def _assert_persist(self, backend):
+        fm = backend.forward_metadata
+        self.assertIsNone(fm.paged_mla_block_tables)
+        self.assertIsNone(fm.paged_mla_seq_lens)
+        self.assertIsNotNone(fm.work_metadata)
+        backend.make_mla_meta_data.assert_called_once()
+
+    def test_eager_metadata_splits_paged_and_persist_batches(self):
+        paged = _metadata_backend(paged=True)
+        paged.init_forward_metadata(_decode_batch())
+        self._assert_paged(paged)
+
+        persist = _metadata_backend(paged=False)
+        persist.init_forward_metadata(_decode_batch())
+        self._assert_persist(persist)
+        persist.make_mla_decode_meta_data_buffer.assert_called_once()
+
+    def test_cuda_graph_metadata_splits_paged_and_persist_batches(self):
+        for paged, check in ((True, self._assert_paged), (False, self._assert_persist)):
+            with self.subTest(paged=paged):
+                backend = _metadata_backend(paged=paged)
+                fb = _decode_batch()
+                backend._apply_cuda_graph_metadata(
+                    bs=fb.batch_size,
+                    req_pool_indices=fb.req_pool_indices,
+                    seq_lens=fb.seq_lens,
+                    seq_lens_sum=fb.seq_lens_sum,
+                    forward_mode=fb.forward_mode,
+                    spec_info=None,
+                    seq_lens_cpu=fb.seq_lens_cpu,
+                    verify_tokens_per_req=None,
+                )
+                check(backend)
+                if paged:
+                    self.assertEqual(
+                        backend.forward_metadata.paged_mla_block_tables.data_ptr(),
+                        backend.cuda_graph_paged_mla_block_tables.data_ptr(),
+                    )
+                else:
+                    self.assertIs(
+                        backend.forward_metadata.work_metadata, backend.work_metadata
+                    )
 
 
 class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
