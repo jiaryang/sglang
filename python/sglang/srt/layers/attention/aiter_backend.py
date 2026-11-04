@@ -724,8 +724,9 @@ class AiterAttnBackend(AttentionBackend):
                     dcp_world_size=self.dcp_world_size,
                     qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
                 )
-            # gfx950 mla_gluon is off on gfx1250 (_gluon_fn), and its capability
-            # log would report the zero-pad fallback that gfx1250 decode skips.
+            # gfx950 mla_gluon is off on gfx1250 (_gluon_fn).
+            # Its capability log would report the zero-pad fallback,
+            # which gfx1250 paged decode does not take.
             elif self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel
