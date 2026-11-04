@@ -717,21 +717,24 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
-            # MLA decode passes a bf16 Q outside DCP, and aiter's default
-            # persistent MLA decode kernels for gfx1250 (hsa/gfx1250/mla_dsl)
-            # take an fp8 Q only; hsa/gfx1250/mla has no persistent kernel.
-            # DCP quantizes Q to fp8 and keeps them.
-            if is_gfx1250_supported() and self.dcp_world_size == 1:
-                _use_mla_ps_kernel = False
-                fast_mode = False
-                intra_batch_mode = False
-            self.use_paged_mla_gluon_decode = supports_paged_mla_gluon_decode(
-                input_dtype=self.input_dtype,
-                page_size=self.page_size,
-                dcp_world_size=self.dcp_world_size,
-                qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
-            )
-            if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
+            if is_gfx1250_supported():
+                # MLA decode passes a bf16 Q outside DCP, and aiter's default
+                # persistent MLA decode kernels for gfx1250 (hsa/gfx1250/mla_dsl)
+                # take an fp8 Q only; hsa/gfx1250/mla has no persistent kernel.
+                # DCP quantizes Q to fp8 and keeps them.
+                if self.dcp_world_size == 1:
+                    _use_mla_ps_kernel = False
+                    fast_mode = False
+                    intra_batch_mode = False
+                self.use_paged_mla_gluon_decode = supports_paged_mla_gluon_decode(
+                    input_dtype=self.input_dtype,
+                    page_size=self.page_size,
+                    dcp_world_size=self.dcp_world_size,
+                    qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
+                )
+            # gfx950 mla_gluon is off on gfx1250 (_gluon_fn), and its capability
+            # log would report the zero-pad fallback that gfx1250 decode skips.
+            elif self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel
                 if (
