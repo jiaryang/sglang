@@ -718,14 +718,6 @@ class AiterAttnBackend(AttentionBackend):
                 fast_mode = False
                 intra_batch_mode = False
             if is_gfx1250_supported():
-                # MLA decode passes a bf16 Q outside DCP, and aiter's default
-                # persistent MLA decode kernels for gfx1250 (hsa/gfx1250/mla_dsl)
-                # take an fp8 Q only; hsa/gfx1250/mla has no persistent kernel.
-                # DCP quantizes Q to fp8 and keeps them.
-                if self.dcp_world_size == 1:
-                    _use_mla_ps_kernel = False
-                    fast_mode = False
-                    intra_batch_mode = False
                 self.use_paged_mla_gluon_decode = supports_paged_mla_gluon_decode(
                     input_dtype=self.input_dtype,
                     page_size=self.page_size,
@@ -2337,8 +2329,7 @@ class AiterAttnBackend(AttentionBackend):
                         page_size=self.page_size,
                     )
                     paged_mla_seq_lens = forward_batch.seq_lens[:bs].to(torch.int32)
-
-                if self._use_mla_decode_persist_metadata():
+                elif self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
                     )
@@ -3287,8 +3278,7 @@ class AiterAttnBackend(AttentionBackend):
                     paged_mla_tables[:, : tables.shape[1]].copy_(tables)
                     paged_mla_seq_lens = self.cuda_graph_paged_mla_seq_lens[:bs]
                     paged_mla_seq_lens.copy_(seq_lens[:bs])
-
-                if self._use_mla_decode_persist_metadata():
+                elif self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
                     )
