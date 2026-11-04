@@ -154,7 +154,6 @@ def mla_gluon_decode(
 def supports_paged_mla_gluon_decode(
     *,
     input_dtype: torch.dtype,
-    page_size: int,
     dcp_world_size: int,
     qk_rope_head_dim: int,
 ) -> bool:
@@ -165,10 +164,18 @@ def supports_paged_mla_gluon_decode(
         and input_dtype == torch.bfloat16
         # BailingMoeV3 with use_mla_nope sets 0, a shape the kernel cannot take.
         and qk_rope_head_dim > 0
-        # The only page size aiter's test_mla_decode_fwd covers for bf16/fp8 KV.
-        and page_size == 64
         and dcp_world_size == 1
     )
+
+
+def paged_mla_tile_size(page_size: int) -> int:
+    """KV tokens per block the kernel reads; each page holds page_size // tile.
+
+    aiter's Gluon decode needs a power-of-2 block size (its shared layouts
+    assert one), and 256 overflows the 320 KB LDS at 128 heads with bf16 KV.
+    Block sizes 1-128 are verified at 8, 16 and 128 heads with bf16 and fp8 KV.
+    """
+    return min(page_size & -page_size, 128)
 
 
 def paged_mla_block_tables(
@@ -178,12 +185,13 @@ def paged_mla_block_tables(
     max_kv_len: int,
     page_size: int,
 ) -> torch.Tensor:
-    """[bs, cdiv(max_kv_len, page_size)] page ids of each request.
+    """[bs, cdiv(max_kv_len, tile)] kernel block ids of each request.
 
-    The paged allocator keeps a page's slots contiguous, so a page id is the
-    slot of the page's first token divided by the page size.
+    The paged allocator keeps a page's slots contiguous from a multiple of
+    page_size, so each tile-aligned slot divided by the tile is a block id.
     """
-    return req_to_token[req_pool_indices, :max_kv_len:page_size] // page_size
+    tile = paged_mla_tile_size(page_size)
+    return req_to_token[req_pool_indices, :max_kv_len:tile] // tile
 
 
 def paged_mla_gluon_decode(
@@ -204,16 +212,16 @@ def paged_mla_gluon_decode(
 
     q is [bs, H, kv_lora_rank + qk_rope_head_dim] and kv_buffer the layer's MLA
     key buffer [num_slots, 1, kv_lora_rank + qk_rope_head_dim]. The kernel reads
-    only the first cdiv(seq_len, page_size) entries of each block_tables row.
+    only the first cdiv(seq_len, tile) entries of each block_tables row, as
+    built by ``paged_mla_block_tables`` for the same page_size.
     Runs aiter's Triton ``mla_decode_fwd``; on gfx1250 its decode kernel is Gluon.
     """
     from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 
+    tile = paged_mla_tile_size(page_size)
     triton_mla_decode_fwd(
         q=q,
-        kv_buffer=kv_buffer.view(
-            -1, page_size, kv_buffer.shape[-2], kv_buffer.shape[-1]
-        ),
+        kv_buffer=kv_buffer.view(-1, tile, kv_buffer.shape[-2], kv_buffer.shape[-1]),
         out=o,
         cu_seqlens_q=cu_seqlens_q,
         seqused_k=seq_lens,

@@ -1144,7 +1144,7 @@ class Envs:
     SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
     # Route MLA decode through aiter's Triton Gluon kernels when their prerequisites
     # hold: Kimi-K3-style h12 + fp8 KV on gfx950, and single-token decode with bf16
-    # activations (bf16 or fp8 KV), page size 64 and no DCP on gfx1250. Set to 0 to
+    # activations (bf16 or fp8 KV) and no DCP on gfx1250. Set to 0 to
     # force the ASM aiter.mla.mla_decode_fwd (benchmarking / emergency disable). On
     # gfx1250 the backend keeps Q in bf16 and the ASM kernels take an fp8 Q only, so
     # decode fails there, as on main.

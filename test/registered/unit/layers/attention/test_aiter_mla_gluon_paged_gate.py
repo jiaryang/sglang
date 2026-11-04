@@ -108,7 +108,6 @@ class TestSupportsPagedMlaGluonDecode(CustomTestCase):
     def _supports(self, gfx1250=True, mla_gluon=True, **overrides):
         kwargs = dict(
             input_dtype=torch.bfloat16,
-            page_size=_PAGE_SIZE,
             dcp_world_size=1,
             qk_rope_head_dim=_ROPE_DIM,
         )
@@ -117,19 +116,15 @@ class TestSupportsPagedMlaGluonDecode(CustomTestCase):
             with envs.SGLANG_AITER_MLA_GLUON.override(mla_gluon):
                 return amg.supports_paged_mla_gluon_decode(**kwargs)
 
-    def test_gfx1250_bf16_page_64_runs_the_paged_kernel(self):
+    def test_gfx1250_bf16_runs_the_paged_kernel(self):
         self.assertTrue(self._supports())
 
     def test_settings_the_kernel_cannot_serve_decline(self):
-        """Only page size 64 is validated; fp16 activations would be run as bf16,
-        DCP decode runs _forward_decode_dcp, which needs an LSE this kernel does not
-        return, a 0 rope dim is a kernel shape error, and
-        SGLANG_AITER_MLA_GLUON=0 turns every aiter Gluon MLA decode off."""
+        """fp16 activations would be run as bf16, DCP decode runs
+        _forward_decode_dcp, which needs an LSE this kernel does not return, a 0
+        rope dim is a kernel shape error, and SGLANG_AITER_MLA_GLUON=0 turns
+        every aiter Gluon MLA decode off."""
         for kwargs in (
-            dict(page_size=1),
-            dict(page_size=16),
-            dict(page_size=32),
-            dict(page_size=128),
             dict(dcp_world_size=2),
             dict(input_dtype=torch.float16),
             dict(qk_rope_head_dim=0),
@@ -140,7 +135,57 @@ class TestSupportsPagedMlaGluonDecode(CustomTestCase):
                 self.assertFalse(self._supports(**kwargs))
 
 
+class TestPagedMlaTileSize(CustomTestCase):
+    def test_tile_is_the_largest_power_of_2_dividing_the_page_up_to_128(self):
+        for page_size, tile in (
+            (1, 1),
+            (3, 1),
+            (12, 4),
+            (16, 16),
+            (64, 64),
+            (96, 32),
+            (128, 128),
+            (256, 128),
+            (1024, 128),
+        ):
+            with self.subTest(page_size=page_size):
+                self.assertEqual(amg.paged_mla_tile_size(page_size), tile)
+
+
 class TestPagedMlaBlockTables(CustomTestCase):
+    def test_pages_larger_than_the_tile_list_every_sub_block(self):
+        """A page of page_size // tile tiles expands to that many consecutive
+        block ids, the rows the (-1, tile) KV view reads."""
+        for page_size in (96, 256):
+            tile = amg.paged_mla_tile_size(page_size)
+            ratio = page_size // tile
+            pages = [4, 1]
+            req_to_token = torch.cat(
+                [p * page_size + torch.arange(page_size) for p in pages]
+            ).to(torch.int32)[None]
+            with self.subTest(page_size=page_size):
+                tables = amg.paged_mla_block_tables(
+                    req_to_token=req_to_token,
+                    req_pool_indices=torch.tensor([0]),
+                    max_kv_len=page_size + 1,
+                    page_size=page_size,
+                )
+                expected = [p * ratio + i for p in pages for i in range(ratio)]
+                torch.testing.assert_close(
+                    tables,
+                    torch.tensor([expected[: ratio + 1]], dtype=torch.int32),
+                )
+
+    def test_page_size_1_lists_every_token_slot(self):
+        req_to_token = torch.tensor([[7, 3, 9, 0], [2, 8, 5, 1]], dtype=torch.int32)
+        tables = amg.paged_mla_block_tables(
+            req_to_token=req_to_token,
+            req_pool_indices=torch.tensor([1, 0]),
+            max_kv_len=3,
+            page_size=1,
+        )
+        torch.testing.assert_close(tables, req_to_token[[1, 0], :3])
+
     def test_page_ids_follow_each_requests_pages(self):
         """A row lists the request's pages in order, one per page_size tokens,
         and is wide enough for the longest sequence."""
@@ -384,6 +429,17 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
         )
         self.assertEqual(call["kv_lora_rank"], _KV_LORA_RANK)
         self.assertEqual(call["qk_rope_head_dim"], _ROPE_DIM)
+
+    def test_kv_buffer_is_viewed_in_kernel_blocks(self):
+        for page_size, tile in ((1, 1), (16, 16), (256, 128)):
+            with self.subTest(page_size=page_size):
+                backend = _backend()
+                backend.page_size = page_size
+                self._decode(backend, _layer(), 1)
+                self.assertEqual(
+                    tuple(self.kernel.calls[-1]["kv_buffer"].shape),
+                    (1024 // tile, tile, 1, _KV_LORA_RANK + _ROPE_DIM),
+                )
 
     def test_no_paged_metadata_runs_the_asm_decode(self):
         """Batches without a paged page table must reach the ASM decode."""

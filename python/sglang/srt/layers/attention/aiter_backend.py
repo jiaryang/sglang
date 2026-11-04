@@ -96,6 +96,7 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
     mla_gluon_decode,
     paged_mla_block_tables,
     paged_mla_gluon_decode,
+    paged_mla_tile_size,
     prefer_mla_gluon_decode,
     supports_paged_mla_gluon_decode,
 )
@@ -739,17 +740,17 @@ class AiterAttnBackend(AttentionBackend):
             if is_gfx1250_supported():
                 self.use_paged_mla_gluon_decode = supports_paged_mla_gluon_decode(
                     input_dtype=self.input_dtype,
-                    page_size=self.page_size,
                     dcp_world_size=self.dcp_world_size,
                     qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
                 )
                 logger.info(
                     "aiter gfx1250 paged MLA Gluon decode is %s",
                     (
-                        "enabled"
+                        f"enabled (page size {self.page_size}, kernel block "
+                        f"size {paged_mla_tile_size(self.page_size)})"
                         if self.use_paged_mla_gluon_decode
                         else "disabled (needs SGLANG_AITER_MLA_GLUON=1, bf16 "
-                        "activations, page size 64, no DCP, qk_rope_head_dim > 0)"
+                        "activations, no DCP, qk_rope_head_dim > 0)"
                     ),
                 )
             # gfx1250 does not use mla_gluon (_gluon_fn), so the gfx950 PS switch
@@ -3062,7 +3063,12 @@ class AiterAttnBackend(AttentionBackend):
 
         if self.use_paged_mla_gluon_decode:
             self.cuda_graph_paged_mla_block_tables = torch.zeros(
-                (max_bs, triton.cdiv(self.req_to_token.shape[1], self.page_size)),
+                (
+                    max_bs,
+                    triton.cdiv(
+                        self.req_to_token.shape[1], paged_mla_tile_size(self.page_size)
+                    ),
+                ),
                 dtype=torch.int32,
                 device=self.device,
             )
