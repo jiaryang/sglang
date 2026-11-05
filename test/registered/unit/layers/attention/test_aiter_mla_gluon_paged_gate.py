@@ -464,8 +464,7 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
             self.assertIs(self._decode(_backend(), layer, 1), self.asm_out)
         self.assertEqual(self.kernel.calls, [])
         log.assert_called_once_with(
-            "aiter gfx1250: MLA layers with logit_cap=30.0 skip the "
-            "paged MLA decode"
+            "aiter gfx1250: MLA layers with logit_cap=30.0 skip the paged MLA decode"
         )
 
     def test_kv_descale_matches_the_asm_decode(self):
