@@ -72,8 +72,8 @@ class TestGluonAvailability(CustomTestCase):
 
     def setUp(self):
         mod._gluon_fn.cache_clear()
-        # gfx1250 turns this kernel off; test_aiter_mla_gluon_paged_gate.py covers that.
-        patcher = mock.patch.object(mod, "is_gfx1250_supported", return_value=False)
+        # The kernel is gfx950-only; test_aiter_mla_gluon_paged_gate.py covers other arches.
+        patcher = mock.patch.object(mod, "is_gfx95_supported", return_value=True)
         patcher.start()
         self.addCleanup(patcher.stop)
 

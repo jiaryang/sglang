@@ -45,7 +45,11 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
 )
-from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_gfx1250_supported,
+    print_info_once,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -869,7 +873,20 @@ class AiterAttnBackend(AttentionBackend):
         self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
     ) -> bool:
         """Per batch: single-token, non-speculative decode when use_paged_mla_gluon_decode
-        holds (gfx1250); other batches take the existing MLA decode dispatch."""
+        holds (gfx1250); other batches take the existing MLA decode dispatch.
+
+        Draft decode is DECODE with spec_info. Its KV is one row per topk branch
+        and the length includes the draft step, which a per-request page table
+        and seq_lens cannot describe.
+        """
+        if (
+            self.use_paged_mla_gluon_decode
+            and spec_info is not None
+            and forward_mode.is_decode()
+        ):
+            print_info_once(
+                "aiter gfx1250: draft decode batches skip the paged Gluon MLA decode"
+            )
         return (
             self.use_paged_mla_gluon_decode
             and spec_info is None
@@ -1685,7 +1702,13 @@ class AiterAttnBackend(AttentionBackend):
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
         fm = self.forward_metadata
-        # The paged kernel has no soft cap; the ASM mla_decode_fwd asserts on one.
+        # The paged kernel has no soft-cap argument, so a capped layer would
+        # silently drop it. The ASM mla_decode_fwd asserts on one instead.
+        if fm.paged_mla_block_tables is not None and layer.logit_cap:
+            print_info_once(
+                "aiter gfx1250: MLA layers with logit_cap="
+                f"{layer.logit_cap} skip the paged Gluon MLA decode"
+            )
         if fm.paged_mla_block_tables is not None and not layer.logit_cap:
             o = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),

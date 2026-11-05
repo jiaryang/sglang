@@ -232,6 +232,17 @@ class TestUsesPagedMlaGluonDecode(CustomTestCase):
                     backend._uses_paged_mla_gluon_decode(mode, spec_info), expected
                 )
 
+    def test_draft_decode_logs_the_skip_and_stays_off_the_paged_path(self):
+        backend = aiter_backend.AiterAttnBackend.__new__(aiter_backend.AiterAttnBackend)
+        backend.use_paged_mla_gluon_decode = True
+        with mock.patch.object(aiter_backend, "print_info_once") as log:
+            self.assertFalse(
+                backend._uses_paged_mla_gluon_decode(ForwardMode.DECODE, object())
+            )
+        log.assert_called_once_with(
+            "aiter gfx1250: draft decode batches skip the paged Gluon MLA decode"
+        )
+
 
 _SPLIT_PAGES = [[3, 5, 7, 9], [2, 4, 6, 8]]
 _SPLIT_SEQ_LENS = [100, 64]
@@ -452,8 +463,13 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
         decode takes logit_cap and rejects what it cannot apply."""
         layer = _layer()
         layer.logit_cap = 30.0
-        self.assertIs(self._decode(_backend(), layer, 1), self.asm_out)
+        with mock.patch.object(aiter_backend, "print_info_once") as log:
+            self.assertIs(self._decode(_backend(), layer, 1), self.asm_out)
         self.assertEqual(self.kernel.calls, [])
+        log.assert_called_once_with(
+            "aiter gfx1250: MLA layers with logit_cap=30.0 skip the "
+            "paged Gluon MLA decode"
+        )
 
     def test_kv_descale_matches_the_asm_decode(self):
         """The MLA store writes K unscaled; only an fp8 cache takes the k_scale."""
@@ -480,10 +496,10 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
                     self.assertEqual(kv_descale.item(), expected)
 
 
-class TestGfx950MlaGluonOnGfx1250(CustomTestCase):
-    def test_gfx950_mla_gluon_is_never_selected_on_gfx1250(self):
-        """gfx1250 must not pick (or report as enabled) the gfx950 kernel;
-        other arches keep picking it."""
+class TestGfx950MlaGluonArch(CustomTestCase):
+    def test_gfx950_mla_gluon_is_selected_only_on_gfx950(self):
+        """Only gfx950 returns aiter.ops.triton.gluon.mla_gluon; every other
+        arch returns None before the import."""
         mla_gluon = object()
         modules = {
             name: types.ModuleType(name)
@@ -506,11 +522,11 @@ class TestGfx950MlaGluonOnGfx1250(CustomTestCase):
         self.addCleanup(amg._gluon_fn.cache_clear)
         with mock.patch.dict(sys.modules, modules):
             with envs.SGLANG_AITER_MLA_GLUON.override(True):
-                for gfx1250, expected in ((True, None), (False, mla_gluon)):
-                    with self.subTest(gfx1250=gfx1250):
+                for gfx95, expected in ((True, mla_gluon), (False, None)):
+                    with self.subTest(gfx95=gfx95):
                         amg._gluon_fn.cache_clear()
                         with mock.patch.object(
-                            amg, "is_gfx1250_supported", return_value=gfx1250
+                            amg, "is_gfx95_supported", return_value=gfx95
                         ):
                             self.assertIs(amg._gluon_fn(), expected)
 
