@@ -105,7 +105,7 @@ class _RecordingKernel:
 
 
 class TestSupportsPagedMlaGluonDecode(CustomTestCase):
-    def _supports(self, gfx1250=True, mla_gluon=True, **overrides):
+    def _supports(self, gfx1250=True, **overrides):
         kwargs = dict(
             input_dtype=torch.bfloat16,
             dcp_world_size=1,
@@ -113,23 +113,20 @@ class TestSupportsPagedMlaGluonDecode(CustomTestCase):
         )
         kwargs.update(overrides)
         with mock.patch.object(amg, "is_gfx1250_supported", return_value=gfx1250):
-            with envs.SGLANG_AITER_MLA_GLUON.override(mla_gluon):
-                return amg.supports_paged_mla_gluon_decode(**kwargs)
+            return amg.supports_paged_mla_gluon_decode(**kwargs)
 
     def test_gfx1250_bf16_runs_the_paged_kernel(self):
         self.assertTrue(self._supports())
 
     def test_settings_the_kernel_cannot_serve_decline(self):
         """fp16 activations would be run as bf16, DCP decode runs
-        _forward_decode_dcp, which needs an LSE this kernel does not return, a 0
-        rope dim is a kernel shape error, and SGLANG_AITER_MLA_GLUON=0 turns
-        every aiter Gluon MLA decode off."""
+        _forward_decode_dcp, which needs an LSE this kernel does not return, and a
+        0 rope dim is a kernel shape error."""
         for kwargs in (
             dict(dcp_world_size=2),
             dict(input_dtype=torch.float16),
             dict(qk_rope_head_dim=0),
             dict(gfx1250=False),
-            dict(mla_gluon=False),
         ):
             with self.subTest(**kwargs):
                 self.assertFalse(self._supports(**kwargs))
@@ -240,7 +237,7 @@ class TestUsesPagedMlaGluonDecode(CustomTestCase):
                 backend._uses_paged_mla_gluon_decode(ForwardMode.DECODE, object())
             )
         log.assert_called_once_with(
-            "aiter gfx1250: draft decode batches skip the paged Gluon MLA decode"
+            "aiter gfx1250: draft decode batches skip the paged MLA decode"
         )
 
 
@@ -468,7 +465,7 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
         self.assertEqual(self.kernel.calls, [])
         log.assert_called_once_with(
             "aiter gfx1250: MLA layers with logit_cap=30.0 skip the "
-            "paged Gluon MLA decode"
+            "paged MLA decode"
         )
 
     def test_kv_descale_matches_the_asm_decode(self):

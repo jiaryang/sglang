@@ -1,15 +1,17 @@
-"""aiter Gluon MLA decode wrappers for the aiter attention backend.
+"""aiter Triton MLA decode wrappers for the aiter attention backend.
 
-Two independent kernels, both turned off by ``SGLANG_AITER_MLA_GLUON=0``:
+Two independent paths:
 
 - gfx950: ``aiter.ops.triton.gluon.mla_gluon`` for low head-count fp8 MLA
   (e.g. Kimi K3 TP8, 12 heads/GPU) over token-level kv_indices. Needs aiter with
   ROCm/aiter #4480 (batch>1 ``bh16bn128``) and #4555 (decode CUDA graph KV splits)
   and Triton >= 3.7 (Gluon ``cga_layout``); otherwise the caller zero-pads heads
-  for the ASM ``aiter.mla.mla_decode_fwd``.
-- gfx1250: ``aiter.ops.triton.attention.mla.mla_decode_fwd``, whose decode kernel
-  on gfx1250 is Gluon, over paged block tables with a bf16 query. Needs aiter
-  with ROCm/aiter#5935.
+  for the ASM ``aiter.mla.mla_decode_fwd``. ``SGLANG_AITER_MLA_GLUON=0`` turns
+  it off.
+- gfx1250: ``aiter.ops.triton.attention.mla.mla_decode_fwd`` over paged block
+  tables with a bf16 query; aiter picks the kernel behind it. Needs aiter with
+  ROCm/aiter#5935. There is no other aiter kernel for a bf16 query on gfx1250,
+  so no env turns it off; ``--decode-attention-backend triton`` leaves aiter.
 """
 
 from __future__ import annotations
@@ -160,8 +162,7 @@ def supports_paged_mla_gluon_decode(
 ) -> bool:
     """Whether single-token MLA decode runs ``paged_mla_gluon_decode``."""
     return (
-        envs.SGLANG_AITER_MLA_GLUON.get()
-        and is_gfx1250_supported()
+        is_gfx1250_supported()
         and input_dtype == torch.bfloat16
         # BailingMoeV3 with use_mla_nope sets 0, a shape the kernel cannot take.
         and qk_rope_head_dim > 0
@@ -172,8 +173,9 @@ def supports_paged_mla_gluon_decode(
 def paged_mla_tile_size(page_size: int) -> int:
     """KV tokens per block the kernel reads; each page holds page_size // tile.
 
-    aiter's Gluon decode needs a power-of-2 block size (its shared layouts
-    assert one), and 256 overflows the 320 KB LDS at 128 heads with bf16 KV.
+    aiter's gfx1250 decode kernel, Gluon at the pinned aiter, needs a power-of-2
+    block size (its shared layouts assert one), and 256 overflows the 320 KB LDS
+    at 128 heads with bf16 KV.
     Block sizes 1-128 are verified at 8, 16 and 128 heads with bf16 and fp8 KV.
     """
     return min(page_size & -page_size, 128)
@@ -215,7 +217,7 @@ def paged_mla_gluon_decode(
     key buffer [num_slots, 1, kv_lora_rank + qk_rope_head_dim]. The kernel reads
     only the first cdiv(seq_len, tile) entries of each block_tables row, as
     built by ``paged_mla_block_tables`` for the same page_size.
-    Runs aiter's Triton ``mla_decode_fwd``; on gfx1250 its decode kernel is Gluon.
+    Runs aiter's Triton ``mla_decode_fwd``, which picks the decode kernel.
     """
     from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 

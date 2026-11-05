@@ -269,7 +269,7 @@ class ForwardMetadata:
     cprr_empty_rows: Optional[torch.Tensor] = None
     # paged_attention_ragged grid size; None means max_num_partitions.
     decode_num_partitions: Optional[int] = None
-    # gfx1250 paged Gluon MLA decode; None: MLA decode takes the ASM /
+    # gfx1250 paged MLA decode; None: MLA decode takes the ASM /
     # gfx950 mla_gluon dispatch.
     paged_mla_block_tables: Optional[torch.Tensor] = None
     paged_mla_seq_lens: Optional[torch.Tensor] = None
@@ -748,13 +748,13 @@ class AiterAttnBackend(AttentionBackend):
                     qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
                 )
                 logger.info(
-                    "aiter gfx1250 paged MLA Gluon decode is %s",
+                    "aiter gfx1250 paged MLA decode is %s",
                     (
                         f"enabled (page size {self.page_size}, kernel block "
                         f"size {paged_mla_tile_size(self.page_size)})"
                         if self.use_paged_mla_gluon_decode
-                        else "disabled (needs SGLANG_AITER_MLA_GLUON=1, bf16 "
-                        "activations, no DCP, qk_rope_head_dim > 0)"
+                        else "disabled (needs bf16 activations, no DCP, "
+                        "qk_rope_head_dim > 0)"
                     ),
                 )
             # gfx1250 does not use mla_gluon (_gluon_fn), so the gfx950 PS switch
@@ -885,7 +885,7 @@ class AiterAttnBackend(AttentionBackend):
             and forward_mode.is_decode()
         ):
             print_info_once(
-                "aiter gfx1250: draft decode batches skip the paged Gluon MLA decode"
+                "aiter gfx1250: draft decode batches skip the paged MLA decode"
             )
         return (
             self.use_paged_mla_gluon_decode
@@ -1707,7 +1707,7 @@ class AiterAttnBackend(AttentionBackend):
         if fm.paged_mla_block_tables is not None and layer.logit_cap:
             print_info_once(
                 "aiter gfx1250: MLA layers with logit_cap="
-                f"{layer.logit_cap} skip the paged Gluon MLA decode"
+                f"{layer.logit_cap} skip the paged MLA decode"
             )
         if fm.paged_mla_block_tables is not None and not layer.logit_cap:
             o = q.new_empty(
