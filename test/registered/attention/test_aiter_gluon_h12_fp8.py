@@ -72,10 +72,6 @@ class TestGluonAvailability(CustomTestCase):
 
     def setUp(self):
         mod._gluon_fn.cache_clear()
-        # The kernel is gfx950-only; test_aiter_triton_mla_decode.py covers other arches.
-        patcher = mock.patch.object(mod, "is_gfx95_supported", return_value=True)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         mod._gluon_fn.cache_clear()

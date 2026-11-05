@@ -20,7 +20,6 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -33,12 +32,6 @@ def _gluon_fn():
     """aiter mla gluon entry point return None if disabled"""
     if not envs.SGLANG_AITER_MLA_GLUON.get():
         logger.info("aiter mla gluon is disabled manually.")
-        return None
-    if not is_gfx95_supported():
-        logger.info(
-            "aiter mla gluon is unavailable: aiter.ops.triton.gluon.mla_gluon "
-            "requires gfx950."
-        )
         return None
     try:
         import triton

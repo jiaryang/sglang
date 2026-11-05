@@ -7,9 +7,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_backend
-from sglang.srt.layers.attention import aiter_mla_gluon as amg
 from sglang.srt.layers.attention import aiter_triton_mla as atm
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -496,41 +494,6 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
                     self.assertIsNone(kv_descale)
                 else:
                     self.assertEqual(kv_descale.item(), expected)
-
-
-class TestGfx950MlaGluonArch(CustomTestCase):
-    def test_gfx950_mla_gluon_is_selected_only_on_gfx950(self):
-        """Only gfx950 returns aiter.ops.triton.gluon.mla_gluon; every other
-        arch returns None before the import."""
-        mla_gluon = object()
-        modules = {
-            name: types.ModuleType(name)
-            for name in (
-                "triton",
-                "triton.experimental",
-                "triton.experimental.gluon",
-                "triton.experimental.gluon.language",
-                "aiter",
-                "aiter.ops",
-                "aiter.ops.triton",
-                "aiter.ops.triton.gluon",
-                "aiter.ops.triton.gluon.mla_gluon",
-            )
-        }
-        modules["triton.experimental.gluon.language"].PaddedSharedLayout = (
-            lambda cga_layout=None: None
-        )
-        modules["aiter.ops.triton.gluon.mla_gluon"].mla_gluon = mla_gluon
-        self.addCleanup(amg._gluon_fn.cache_clear)
-        with mock.patch.dict(sys.modules, modules):
-            with envs.SGLANG_AITER_MLA_GLUON.override(True):
-                for gfx95, expected in ((True, mla_gluon), (False, None)):
-                    with self.subTest(gfx95=gfx95):
-                        amg._gluon_fn.cache_clear()
-                        with mock.patch.object(
-                            amg, "is_gfx95_supported", return_value=gfx95
-                        ):
-                            self.assertIs(amg._gluon_fn(), expected)
 
 
 if __name__ == "__main__":
