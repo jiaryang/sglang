@@ -72,7 +72,7 @@ class TestGluonAvailability(CustomTestCase):
 
     def setUp(self):
         mod._gluon_fn.cache_clear()
-        # The kernel is gfx950-only; test_aiter_mla_gluon_paged_gate.py covers other arches.
+        # The kernel is gfx950-only; test_aiter_triton_mla_decode.py covers other arches.
         patcher = mock.patch.object(mod, "is_gfx95_supported", return_value=True)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -258,7 +258,7 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
             reduce_final_map=None,
             reduce_partial_map=None,
             num_kv_splits=None,
-            paged_mla_block_tables=None,
+            triton_mla_block_tables=None,
         )
         be.token_to_kv_pool = mock.Mock(
             get_key_buffer=lambda _lid: torch.zeros(8, 576, dtype=fp8_dtype)

@@ -1145,7 +1145,7 @@ class Envs:
     # Route Kimi-K3-style h12 + fp8 MLA decode through aiter Triton Gluon when
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
-    # gfx950 only; the gfx1250 paged MLA decode does not read it.
+    # gfx950 only; the gfx1250 aiter Triton MLA decode does not read it.
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
     # Which AITER MLA decode kernel to prefer, "asm" or "gluon", when both can serve
     # the batch (gfx950 h12 fp8); with DCP it picks the kernel outright. gfx1250
