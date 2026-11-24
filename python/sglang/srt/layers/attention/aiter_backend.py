@@ -170,7 +170,8 @@ _use_fp8_prefill_attn = (
 _use_mla_prefix_fused_k = get_bool_env_var("SGLANG_AITER_MLA_PREFIX_FUSED_K", "False")
 
 # On top of the fused prefix K path: FP8 q/k/v into the gfx1250 ASM FP8 varlen
-# FMHA (hd192x128). Needs aiter with ROCm/aiter#7375; the gfx1250 pin in
+# FMHA (hd192x128), also for extend batches without a cached prefix.
+# Needs aiter with ROCm/aiter#7375; the gfx1250 pin in
 # docker/rocm.Dockerfile (07ff5f318) predates it, and older aiter runs a
 # different FP8 kernel here.
 _use_gfx1250_fp8_prefill_attn = (
@@ -4723,6 +4724,22 @@ class AiterAttnBackend(AttentionBackend):
                             v,
                             layer,
                         )
+                    elif self._mla_prefix_fp8_fmha_applies(layer):
+                        # Same FP8 FMHA and unit scales as _mla_prefix_attn_fused.
+                        output = flash_attn_varlen_fp8_pertensor_func(
+                            q.to(fp8_dtype),
+                            k.to(fp8_dtype),
+                            v.to(fp8_dtype),
+                            self.q_scale,
+                            self.k_scale,
+                            self.v_scale,
+                            qo_indptr,
+                            qo_indptr,
+                            max_q_len,
+                            max_q_len,
+                            softmax_scale=layer.scaling,
+                            causal=True,
+                        ).to(q.dtype)
                     else:
                         output = flash_attn_varlen_func(
                             q,
